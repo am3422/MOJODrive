@@ -192,8 +192,6 @@ class LocationService : Service(), LocationListener {
 
     override fun onProviderEnabled(provider: String) = Unit
     override fun onProviderDisabled(provider: String) = Unit
-    @Deprecated("Deprecated in Android API")
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
 
     override fun onDestroy() {
         try {
