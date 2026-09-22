@@ -18,9 +18,11 @@ import java.util.Locale
 class MainActivity : Activity() {
 
     private lateinit var speedText: TextView
+    private lateinit var limitText: TextView
+    private lateinit var cameraText: TextView
+    private lateinit var gpsText: TextView
     private lateinit var statusText: TextView
     private lateinit var coordsText: TextView
-    private lateinit var accuracyText: TextView
     private lateinit var sensorText: TextView
     private lateinit var logText: TextView
     private lateinit var thresholdInput: EditText
@@ -31,7 +33,7 @@ class MainActivity : Activity() {
     private val poller = object : Runnable {
         override fun run() {
             refreshUi()
-            handler.postDelayed(this, 500)
+            handler.postDelayed(this, 400)
         }
     }
 
@@ -58,7 +60,7 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(28), dp(22), dp(22))
+            setPadding(dp(22), dp(24), dp(22), dp(24))
             setBackgroundColor(Color.rgb(245, 247, 250))
         }
 
@@ -70,51 +72,71 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.2 • GPS + Accelerometer + Gyroscope + Trip Log"
+            text = "MVP 0.4 • Direction-aware Camera Assistant"
             textSize = 14f
             setTextColor(Color.DKGRAY)
-            setPadding(0, dp(4), 0, dp(20))
+            setPadding(0, dp(4), 0, dp(12))
         })
 
         speedText = TextView(this).apply {
             text = "0 km/h"
-            textSize = 44f
+            textSize = 52f
             gravity = Gravity.CENTER
             setTextColor(Color.rgb(20, 91, 210))
             typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setPadding(0, dp(14), 0, dp(8))
+            setPadding(0, dp(10), 0, dp(2))
         }
         root.addView(speedText, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
 
-        statusText = TextView(this).apply {
-            text = "Stopped"
+        limitText = TextView(this).apply {
+            text = "LIMIT 80 km/h"
+            textSize = 25f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(30, 30, 30))
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(10))
+        }
+        root.addView(limitText)
+
+        cameraText = TextView(this).apply {
+            text = "Camera: --"
             textSize = 17f
             gravity = Gravity.CENTER
+            setTextColor(Color.rgb(90, 70, 20))
+            setPadding(0, dp(4), 0, dp(8))
+        }
+        root.addView(cameraText)
+
+        gpsText = TextView(this).apply {
+            text = "GPS: waiting"
+            textSize = 16f
+            gravity = Gravity.CENTER
             setTextColor(Color.DKGRAY)
-            setPadding(0, 0, 0, dp(18))
+            setPadding(0, 0, 0, dp(6))
+        }
+        root.addView(gpsText)
+
+        statusText = TextView(this).apply {
+            text = "Stopped"
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(Color.DKGRAY)
+            setPadding(0, 0, 0, dp(14))
         }
         root.addView(statusText)
 
         coordsText = TextView(this).apply {
             text = "Location: --"
-            textSize = 15f
+            textSize = 14f
             setTextColor(Color.DKGRAY)
         }
         root.addView(coordsText)
 
-        accuracyText = TextView(this).apply {
-            text = "GPS accuracy: --"
-            textSize = 15f
-            setTextColor(Color.DKGRAY)
-            setPadding(0, dp(5), 0, dp(5))
-        }
-        root.addView(accuracyText)
-
         sensorText = TextView(this).apply {
             text = "Sensors: --"
-            textSize = 15f
+            textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(5), 0, dp(5))
         }
@@ -124,13 +146,13 @@ class MainActivity : Activity() {
             text = "Last log: --"
             textSize = 13f
             setTextColor(Color.GRAY)
-            setPadding(0, dp(5), 0, dp(18))
+            setPadding(0, dp(5), 0, dp(16))
         }
         root.addView(logText)
 
         root.addView(TextView(this).apply {
-            text = "Speed warning threshold (km/h)"
-            textSize = 15f
+            text = "Fallback speed limit outside camera zones (km/h)"
+            textSize = 14f
             setTextColor(Color.rgb(25, 30, 38))
         })
 
@@ -147,7 +169,15 @@ class MainActivity : Activity() {
             setOnClickListener { startDrive() }
         }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(58)
-        ).apply { topMargin = dp(20) })
+        ).apply { topMargin = dp(18) })
+
+        root.addView(Button(this).apply {
+            text = "MARK / BUMP NOW"
+            textSize = 16f
+            setOnClickListener { markEvent() }
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+        ).apply { topMargin = dp(8) })
 
         root.addView(Button(this).apply {
             text = "STOP & SAVE LOG"
@@ -155,22 +185,20 @@ class MainActivity : Activity() {
             setOnClickListener { stopDrive() }
         }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(54)
-        ).apply { topMargin = dp(10) })
+        ).apply { topMargin = dp(8) })
 
         root.addView(Button(this).apply {
             text = "OPEN LOCATION SETTINGS"
-            setOnClickListener {
-                startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
-            }
+            setOnClickListener { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
         }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(50)
-        ).apply { topMargin = dp(10) })
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(48)
+        ).apply { topMargin = dp(8) })
 
         root.addView(TextView(this).apply {
-            text = "Tomorrow test: Start Drive, lock the phone, drive normally, then press STOP & SAVE LOG after parking. The CSV in Downloads/MOJODrive contains GPS, accelerometer and gyroscope data matched by timestamp/location."
-            textSize = 13f
+            text = "0.4 test: offline Shiraz speed + red-light cameras, real carriageway direction from Neshan road geometry, dynamic speed reference, stronger alerts, GPS stale protection and richer logs."
+            textSize = 12f
             setTextColor(Color.GRAY)
-            setPadding(0, dp(18), 0, 0)
+            setPadding(0, dp(16), 0, 0)
         })
 
         setContentView(ScrollView(this).apply { addView(root) })
@@ -181,15 +209,9 @@ class MainActivity : Activity() {
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
         )
-        if (Build.VERSION.SDK_INT >= 33) {
-            permissions += Manifest.permission.POST_NOTIFICATIONS
-        }
-        val missing = permissions.filter {
-            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
-        }
-        if (missing.isNotEmpty()) {
-            requestPermissions(missing.toTypedArray(), 1001)
-        }
+        if (Build.VERSION.SDK_INT >= 33) permissions += Manifest.permission.POST_NOTIFICATIONS
+        val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1001)
     }
 
     private fun startDrive() {
@@ -204,18 +226,23 @@ class MainActivity : Activity() {
 
         val intent = Intent(this, LocationService::class.java)
             .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
-
         startForegroundService(intent)
-        Toast.makeText(this, "MOJO Drive logging started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.4 started.", Toast.LENGTH_SHORT).show()
         refreshUi()
+    }
+
+    private fun markEvent() {
+        if (!prefs.getBoolean("running", false)) {
+            Toast.makeText(this, "Start Drive first.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startService(Intent(this, LocationService::class.java).setAction(LocationService.ACTION_MARK_EVENT))
+        Toast.makeText(this, "Event marked in log.", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopDrive() {
         stopService(Intent(this, LocationService::class.java))
-        prefs.edit()
-            .putBoolean("running", false)
-            .putFloat("speed_kmh", 0f)
-            .apply()
+        prefs.edit().putBoolean("running", false).apply()
         Toast.makeText(this, "Stopping and saving trip log…", Toast.LENGTH_SHORT).show()
         handler.postDelayed({ refreshUi() }, 1200)
     }
@@ -227,16 +254,44 @@ class MainActivity : Activity() {
         val lon = prefs.getString("lon", null)
         val accuracy = prefs.getFloat("accuracy_m", -1f)
         val provider = prefs.getString("provider", "--") ?: "--"
+        val gpsAge = prefs.getLong("gps_age_ms", -1L)
+        val gpsStale = prefs.getBoolean("gps_stale", true)
+        val activeLimit = prefs.getInt("active_limit_kmh", prefs.getInt("threshold_kmh", 80))
+        val cameraId = prefs.getString("camera_id", "") ?: ""
+        val cameraDistance = prefs.getFloat("camera_distance_m", -1f)
+        val cameraLimit = prefs.getInt("camera_limit_kmh", -1)
+        val cameraRoad = prefs.getString("camera_road_name", "") ?: ""
+        val cameraType = prefs.getString("camera_type", "") ?: ""
+        val roadBearing = prefs.getFloat("camera_road_bearing", -1f)
+        val directionDelta = prefs.getFloat("camera_direction_delta", -1f)
+        val confidence = prefs.getString("camera_confidence", "") ?: ""
         val accel = prefs.getBoolean("accel_available", false)
         val gyro = prefs.getBoolean("gyro_available", false)
+        val cameraCount = prefs.getInt("camera_count", 0)
         val lastLog = prefs.getString("last_log_name", null)
 
         speedText.text = String.format(Locale.US, "%.0f km/h", speed)
-        statusText.text = if (running) "ACTIVE • $provider • logging" else "Stopped"
+        speedText.setTextColor(if (running && !gpsStale && speed >= activeLimit + 1f) Color.rgb(210, 35, 35) else Color.rgb(20, 91, 210))
+
+        val dynamic = cameraId.isNotEmpty() && cameraLimit > 0
+        limitText.text = if (dynamic) "LIMIT $activeLimit km/h • CAMERA" else "LIMIT $activeLimit km/h"
+
+        cameraText.text = if (cameraId.isNotEmpty() && cameraDistance >= 0f) {
+            val road = if (cameraRoad.isNotBlank()) " • $cameraRoad" else ""
+            val lim = if (cameraLimit > 0) " • $cameraLimit km/h" else ""
+            "${if (cameraType == "red_light") "Red-light camera" else "Speed camera"} $cameraId • ${cameraDistance.toInt()} m$lim$road${if (roadBearing >= 0f) " • road ${roadBearing.toInt()}°" else ""}${if (directionDelta >= 0f) " • Δ${directionDelta.toInt()}°" else ""}${if (confidence.isNotBlank()) " • $confidence" else ""}"
+        } else "Camera: --"
+
+        gpsText.text = when {
+            !running -> "GPS: stopped"
+            gpsAge < 0 -> "GPS: waiting for valid speed fix"
+            gpsStale -> String.format(Locale.US, "GPS: STALE • %.1f s • acc %.1f m", gpsAge / 1000.0, accuracy)
+            else -> String.format(Locale.US, "GPS: OK • age %.1f s • acc %.1f m", gpsAge / 1000.0, accuracy)
+        }
+        gpsText.setTextColor(if (gpsStale && running) Color.rgb(200, 60, 30) else Color.rgb(35, 120, 60))
+
+        statusText.text = if (running) "ACTIVE • $provider • $cameraCount Shiraz cameras loaded" else "Stopped"
         coordsText.text = if (lat != null && lon != null) "Location: $lat, $lon" else "Location: --"
-        accuracyText.text = if (accuracy >= 0f)
-            String.format(Locale.US, "GPS accuracy: %.1f m", accuracy)
-        else "GPS accuracy: --"
         sensorText.text = "Sensors: Accelerometer ${if (accel) "OK" else "--"} • Gyroscope ${if (gyro) "OK" else "--"}"
         logText.text = if (lastLog != null) "Last log: Downloads/MOJODrive/$lastLog" else "Last log: --"
     }

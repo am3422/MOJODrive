@@ -11,8 +11,8 @@ android {
         applicationId = "com.mojotech.mojodrive"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 4
+        versionName = "0.4"
     }
 
     compileOptions {

@@ -1,25 +1,24 @@
-# MOJO Drive — MVP 0.2
+# MOJO Drive MVP 0.4
 
-Feasibility build for real driving tests.
+Android driving assistant prototype for Shiraz.
 
-## Added in 0.2
-- GPS current speed / bearing / accuracy
-- Foreground tracking with screen locked
-- Overspeed alert
-- Accelerometer logging (~20 Hz)
-- Gyroscope logging (~20 Hz)
-- Sensor records timestamp-matched with the latest GPS location/speed
-- Automatic CSV export when STOP & SAVE LOG is pressed
-- Log destination on Android 10+: `Downloads/MOJODrive/`
+## Included offline data
+- 252 speed cameras
+- 15 red-light cameras
+- Neshan basemap road match for camera road name/class
+- `routable` road speed reference where available
+- one-way carriageway geometry bearing and direction confidence
 
-## CSV record types
-- `START`
-- `GPS`
-- `ACCEL`
-- `GYRO`
-- `OVERSPEED_ALERT`
-- `STOP`
+## Runtime behavior
+- GPS-only valid speed fixes with stale-GPS protection
+- 3-sample median speed filtering
+- real carriageway direction filtering for one-way camera roads
+- forward/corridor fallback for two-way or uncertain roads
+- dynamic warning distance based on current speed
+- separate speed-camera and red-light-camera warnings
+- repeated overspeed warning every 7 seconds while over the active limit
+- accelerometer/gyroscope trip logging
+- manual `MARK / BUMP NOW` marker for future bump detector training
+- partial wake lock for locked-screen tracking
 
-Use the CSV after a real trip to analyze motion start/stop, braking/acceleration, bumps/shocks, GPS quality, and candidate speed bumps.
-
-For safety, never interact with the phone while driving.
+`routable` is treated as Neshan's road routing/reference speed, not asserted as the legal posted speed limit.
