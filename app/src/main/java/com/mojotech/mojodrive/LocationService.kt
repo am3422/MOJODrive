@@ -33,7 +33,11 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         const val ACTION_MARK_EVENT = "com.mojotech.mojodrive.MARK_EVENT"
         private const val CHANNEL_ID = "mojo_drive_tracking"
         private const val NOTIFICATION_ID = 100
-        private const val GPS_STALE_MS = 5000L
+        private const val GPS_STALE_MS = 8000L
+        private const val FUSION_BRIDGE_MS = 8000L
+        private const val FUSION_MIN_SPEED_KMH = 5f
+        private const val BUMP_CANDIDATE_COOLDOWN_MS = 1200L
+        private const val BUMP_CANDIDATE_SHOCK_MPS2 = 3.2f
         private const val OVERSPEED_REPEAT_MS = 7000L
         private const val CAMERA_MAX_SEARCH_M = 1500f
         private const val ROAD_DIRECTION_MAX_DELTA_DEG = 45f
@@ -48,6 +52,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private var accelerometer: Sensor? = null
     private var gyroscope: Sensor? = null
+    private var linearAcceleration: Sensor? = null
+    private var rotationVector: Sensor? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var tone: ToneGenerator? = null
     private var cameras: List<CameraPoint> = emptyList()
@@ -56,6 +62,17 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private val speedSamples = ArrayDeque<Float>()
     private val cameraWarned = HashSet<String>()
     private val cameraUrgentWarned = HashSet<String>()
+    private val rotationMatrix = FloatArray(9)
+    private var rotationReady = false
+    private var fusionInitialized = false
+    private var fusionSpeedMps = 0f
+    private var fusionVariance = 4f
+    private var lastFusionSensorNs = 0L
+    private var latestGpsFilteredKmh = Float.NaN
+    private var latestForwardAccelMps2 = 0f
+    private var fusionActive = false
+    private var imuBridgeActive = false
+    private var lastBumpCandidateElapsed = 0L
 
     private var manualThresholdKmh = 80
     private var activeLimitKmh = 80
@@ -104,6 +121,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        linearAcceleration = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+        rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
         tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
 
         try {
@@ -115,6 +134,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         prefs.edit()
             .putBoolean("accel_available", accelerometer != null)
             .putBoolean("gyro_available", gyroscope != null)
+            .putBoolean("linear_accel_available", linearAcceleration != null)
+            .putBoolean("rotation_vector_available", rotationVector != null)
             .putInt("camera_count", cameras.size)
             .apply()
 
@@ -162,7 +183,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         logFile = File(filesDir, logName)
         logFile.writeText(
             "wall_time_ms,iso_time,record_type,lat,lon,provider,gps_age_ms,gps_stale,speed_valid," +
-                "raw_speed_kmh,speed_kmh,bearing_deg,bearing_valid,gps_accuracy_m,camera_id," +
+                "raw_speed_kmh,gps_filtered_kmh,fused_speed_kmh,forward_accel_mps2,fusion_active,imu_bridge,bearing_deg,bearing_valid,gps_accuracy_m,camera_id," +
                 "camera_type,camera_distance_m,camera_limit_kmh,camera_bearing_delta_deg,camera_road_bearing_deg," +
                 "camera_direction_delta_deg,camera_lateral_m,active_limit_kmh,x,y,z,magnitude,sensor_timestamp_ns,details\n"
         )
@@ -192,6 +213,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private fun startSensorUpdates() {
         accelerometer?.let { sensorManager.registerListener(this, it, 20_000) }
         gyroscope?.let { sensorManager.registerListener(this, it, 20_000) }
+        linearAcceleration?.let { sensorManager.registerListener(this, it, 20_000) }
+        rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
     }
 
     override fun onLocationChanged(location: Location) {
@@ -217,18 +240,24 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             rawSpeed in 0f..250f
 
         if (accepted) {
-            latestSpeedKmh = filteredSpeed(rawSpeed)
+            latestGpsFilteredKmh = filteredSpeed(rawSpeed)
             lastValidGpsElapsedMs = SystemClock.elapsedRealtime()
             gpsStale = false
+            imuBridgeActive = false
 
-            latestBearingValid = location.hasBearing() && latestSpeedKmh >= DIRECTION_MIN_SPEED_KMH
+            latestBearingValid = location.hasBearing() && latestGpsFilteredKmh >= DIRECTION_MIN_SPEED_KMH
             if (latestBearingValid) latestBearing = location.bearing
+
+            val gpsSpeedAccuracyMps = if (Build.VERSION.SDK_INT >= 26 && location.hasSpeedAccuracy()) {
+                location.speedAccuracyMetersPerSecond.coerceIn(0.3f, 5.5f)
+            } else 2.0f
+            correctFusionWithGps(latestGpsFilteredKmh / 3.6f, gpsSpeedAccuracyMps)
+            latestSpeedKmh = (fusionSpeedMps * 3.6f).coerceIn(0f, 250f)
 
             evaluateCameraTarget()
             handleOverspeed(latestSpeedKmh)
-            appendRow("GPS", Float.NaN, Float.NaN, Float.NaN, Float.NaN, 0L, true, "")
+            appendRow("GPS", Float.NaN, Float.NaN, Float.NaN, Float.NaN, 0L, true, "fusion=${if (fusionActive) "GPS_IMU" else "GPS"}")
         } else {
-            latestBearingValid = false
             appendRow("GPS_REJECTED", Float.NaN, Float.NaN, Float.NaN, Float.NaN, 0L, false, rejectionReason(location, ageMs, speedAccuracyOk))
         }
 
@@ -258,6 +287,73 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         return speedSamples.sorted()[speedSamples.size / 2]
     }
 
+
+    private fun correctFusionWithGps(gpsSpeedMps: Float, speedAccuracyMps: Float) {
+        if (!fusionInitialized) {
+            fusionSpeedMps = gpsSpeedMps.coerceAtLeast(0f)
+            fusionVariance = max(1f, speedAccuracyMps * speedAccuracyMps)
+            fusionInitialized = true
+            fusionActive = linearAcceleration != null && rotationVector != null
+            lastFusionSensorNs = 0L
+            return
+        }
+
+        val measurementVariance = max(0.25f, speedAccuracyMps * speedAccuracyMps)
+        val gain = fusionVariance / (fusionVariance + measurementVariance)
+        fusionSpeedMps += gain * (gpsSpeedMps - fusionSpeedMps)
+        fusionSpeedMps = fusionSpeedMps.coerceIn(0f, 70f)
+        fusionVariance = max(0.05f, (1f - gain) * fusionVariance)
+        fusionActive = linearAcceleration != null && rotationVector != null
+    }
+
+    private fun predictFusion(forwardAccelMps2: Float, sensorTimestampNs: Long) {
+        if (!fusionInitialized || !latestBearingValid || !rotationReady) {
+            lastFusionSensorNs = sensorTimestampNs
+            return
+        }
+
+        if (lastFusionSensorNs <= 0L) {
+            lastFusionSensorNs = sensorTimestampNs
+            return
+        }
+
+        val dt = ((sensorTimestampNs - lastFusionSensorNs) / 1_000_000_000.0f).coerceIn(0f, 0.20f)
+        lastFusionSensorNs = sensorTimestampNs
+        if (dt <= 0f) return
+
+        val age = currentGpsAgeMs()
+        if (age < 0L || age > FUSION_BRIDGE_MS) return
+
+        val a = when {
+            abs(forwardAccelMps2) < 0.08f -> 0f
+            else -> forwardAccelMps2.coerceIn(-8f, 8f)
+        }
+
+        fusionSpeedMps = (fusionSpeedMps + a * dt).coerceIn(0f, 70f)
+        fusionVariance = (fusionVariance + (0.7f * 0.7f * dt)).coerceAtMost(25f)
+        latestForwardAccelMps2 = a
+        latestSpeedKmh = (fusionSpeedMps * 3.6f).coerceIn(0f, 250f)
+        imuBridgeActive = age > 1200L && latestSpeedKmh >= FUSION_MIN_SPEED_KMH
+        fusionActive = true
+
+        if (!gpsStale) handleOverspeed(latestSpeedKmh)
+        updatePrefs()
+    }
+
+    private fun updateForwardAcceleration(event: SensorEvent) {
+        if (!rotationReady || !latestBearingValid || event.values.size < 3) return
+
+        val x = event.values[0]
+        val y = event.values[1]
+        val z = event.values[2]
+
+        val east = rotationMatrix[0] * x + rotationMatrix[1] * y + rotationMatrix[2] * z
+        val north = rotationMatrix[3] * x + rotationMatrix[4] * y + rotationMatrix[5] * z
+        val br = Math.toRadians(latestBearing.toDouble())
+        val forward = (east * sin(br) + north * cos(br)).toFloat()
+        predictFusion(forward, event.timestamp)
+    }
+
     private fun updateGpsStaleState() {
         val age = currentGpsAgeMs()
         val staleNow = age < 0 || age > GPS_STALE_MS
@@ -265,6 +361,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             gpsStale = staleNow
             if (gpsStale && loggingStarted) appendMarker("GPS_STALE")
         }
+        imuBridgeActive = fusionActive && !gpsStale && age > 1200L && latestSpeedKmh >= FUSION_MIN_SPEED_KMH
         updatePrefs()
     }
 
@@ -464,7 +561,26 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (!loggingStarted || event.values.size < 3) return
+        if (event.values.size < 3) return
+
+        when (event.sensor.type) {
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                try {
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                    rotationReady = true
+                } catch (_: Exception) {
+                    rotationReady = false
+                }
+                return
+            }
+
+            Sensor.TYPE_LINEAR_ACCELERATION -> {
+                updateForwardAcceleration(event)
+                return
+            }
+        }
+
+        if (!loggingStarted) return
 
         val type = when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> "ACCEL"
@@ -476,6 +592,15 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val y = event.values[1]
         val z = event.values[2]
         val magnitude = sqrt((x * x + y * y + z * z).toDouble()).toFloat()
+
+        if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+            val shock = abs(magnitude - SensorManager.GRAVITY_EARTH)
+            val now = SystemClock.elapsedRealtime()
+            if (latestSpeedKmh >= 8f && shock >= BUMP_CANDIDATE_SHOCK_MPS2 && now - lastBumpCandidateElapsed >= BUMP_CANDIDATE_COOLDOWN_MS) {
+                lastBumpCandidateElapsed = now
+                appendMarker("BUMP_CANDIDATE", "shock=${String.format(Locale.US, "%.2f", shock)};speed=${String.format(Locale.US, "%.1f", latestSpeedKmh)}")
+            }
+        }
 
         appendRow(type, x, y, z, magnitude, event.timestamp, !gpsStale, "")
     }
@@ -507,6 +632,9 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val lon = if (latestLon.isNaN()) "" else String.format(Locale.US, "%.7f", latestLon)
         val gpsAge = currentGpsAgeMs()
         val rawSpeed = if (latestRawSpeedKmh.isNaN()) "" else String.format(Locale.US, "%.3f", latestRawSpeedKmh)
+        val gpsFiltered = if (latestGpsFilteredKmh.isNaN()) "" else String.format(Locale.US, "%.3f", latestGpsFilteredKmh)
+        val fusedSpeed = String.format(Locale.US, "%.3f", latestSpeedKmh)
+        val forwardAccel = String.format(Locale.US, "%.4f", latestForwardAccelMps2)
         val bearing = if (latestBearingValid) String.format(Locale.US, "%.3f", latestBearing) else ""
         val cameraDistance = if (activeCameraDistanceM >= 0f) String.format(Locale.US, "%.2f", activeCameraDistanceM) else ""
         val cameraLimit = activeCameraSpeedLimit?.toString() ?: ""
@@ -522,7 +650,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val row = listOf(
             wall.toString(), iso, recordType, lat, lon, latestProvider,
             gpsAge.toString(), gpsStale.toString(), speedValid.toString(), rawSpeed,
-            String.format(Locale.US, "%.3f", latestSpeedKmh), bearing,
+            gpsFiltered, fusedSpeed, forwardAccel, fusionActive.toString(), imuBridgeActive.toString(), bearing,
             latestBearingValid.toString(), String.format(Locale.US, "%.2f", latestAccuracy),
             activeCameraId, activeCameraType, cameraDistance, cameraLimit, cameraDelta, cameraRoadBearing, cameraDirectionDelta, cameraLateral,
             activeLimitKmh.toString(), sx, sy, sz, sm, sensorTimestampNs.toString(), details
@@ -542,6 +670,10 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             .putBoolean("running", true)
             .putFloat("speed_kmh", latestSpeedKmh)
             .putFloat("raw_speed_kmh", if (latestRawSpeedKmh.isNaN()) -1f else latestRawSpeedKmh)
+            .putFloat("gps_filtered_kmh", if (latestGpsFilteredKmh.isNaN()) -1f else latestGpsFilteredKmh)
+            .putFloat("forward_accel_mps2", latestForwardAccelMps2)
+            .putBoolean("fusion_active", fusionActive)
+            .putBoolean("imu_bridge", imuBridgeActive)
             .putString("lat", if (latestLat.isNaN()) null else String.format(Locale.US, "%.6f", latestLat))
             .putString("lon", if (latestLon.isNaN()) null else String.format(Locale.US, "%.6f", latestLon))
             .putFloat("accuracy_m", latestAccuracy)
@@ -564,7 +696,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val cameraPart = if (activeCameraId.isNotEmpty() && activeCameraDistanceM >= 0f) {
             " • ${if (activeCameraType == "red_light") "red-light" else "camera"} ${activeCameraDistanceM.roundToInt()}m"
         } else ""
-        val gpsPart = if (gpsStale) " • GPS stale" else ""
+        val gpsPart = when {
+            gpsStale -> " • GPS stale"
+            imuBridgeActive -> " • IMU bridge"
+            fusionActive -> " • GPS+IMU"
+            else -> ""
+        }
         val text = String.format(Locale.US, "%.0f km/h • limit %d%s%s", latestSpeedKmh, activeLimitKmh, cameraPart, gpsPart)
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, makeNotification(text))

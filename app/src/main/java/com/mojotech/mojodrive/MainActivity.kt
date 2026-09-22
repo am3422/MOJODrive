@@ -72,7 +72,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.4 • Direction-aware Camera Assistant"
+            text = "MVP 0.5 • GPS + IMU Fusion Camera Assistant"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(12))
@@ -195,7 +195,7 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(8) })
 
         root.addView(TextView(this).apply {
-            text = "0.4 test: offline Shiraz speed + red-light cameras, real carriageway direction from Neshan road geometry, dynamic speed reference, stronger alerts, GPS stale protection and richer logs."
+            text = "0.5 test: GPS + IMU fused speed, short GPS-gap dead reckoning, offline Shiraz speed + red-light cameras, carriageway direction filtering, automatic bump candidates and richer logs."
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(16), 0, 0)
@@ -227,7 +227,7 @@ class MainActivity : Activity() {
         val intent = Intent(this, LocationService::class.java)
             .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
         startForegroundService(intent)
-        Toast.makeText(this, "MOJO Drive 0.4 started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.5 started.", Toast.LENGTH_SHORT).show()
         refreshUi()
     }
 
@@ -267,6 +267,12 @@ class MainActivity : Activity() {
         val confidence = prefs.getString("camera_confidence", "") ?: ""
         val accel = prefs.getBoolean("accel_available", false)
         val gyro = prefs.getBoolean("gyro_available", false)
+        val linearAccel = prefs.getBoolean("linear_accel_available", false)
+        val rotationVector = prefs.getBoolean("rotation_vector_available", false)
+        val fusionActive = prefs.getBoolean("fusion_active", false)
+        val imuBridge = prefs.getBoolean("imu_bridge", false)
+        val gpsFiltered = prefs.getFloat("gps_filtered_kmh", -1f)
+        val forwardAccel = prefs.getFloat("forward_accel_mps2", 0f)
         val cameraCount = prefs.getInt("camera_count", 0)
         val lastLog = prefs.getString("last_log_name", null)
 
@@ -286,13 +292,15 @@ class MainActivity : Activity() {
             !running -> "GPS: stopped"
             gpsAge < 0 -> "GPS: waiting for valid speed fix"
             gpsStale -> String.format(Locale.US, "GPS: STALE • %.1f s • acc %.1f m", gpsAge / 1000.0, accuracy)
+            imuBridge -> String.format(Locale.US, "GPS: IMU BRIDGE • %.1f s • GPS %.0f km/h", gpsAge / 1000.0, gpsFiltered)
+            fusionActive -> String.format(Locale.US, "GPS+IMU: FUSED • GPS %.0f km/h • a %.2f m/s²", gpsFiltered, forwardAccel)
             else -> String.format(Locale.US, "GPS: OK • age %.1f s • acc %.1f m", gpsAge / 1000.0, accuracy)
         }
         gpsText.setTextColor(if (gpsStale && running) Color.rgb(200, 60, 30) else Color.rgb(35, 120, 60))
 
         statusText.text = if (running) "ACTIVE • $provider • $cameraCount Shiraz cameras loaded" else "Stopped"
         coordsText.text = if (lat != null && lon != null) "Location: $lat, $lon" else "Location: --"
-        sensorText.text = "Sensors: Accelerometer ${if (accel) "OK" else "--"} • Gyroscope ${if (gyro) "OK" else "--"}"
+        sensorText.text = "Sensors: Accel ${if (accel) "OK" else "--"} • Gyro ${if (gyro) "OK" else "--"} • Linear ${if (linearAccel) "OK" else "--"} • Rotation ${if (rotationVector) "OK" else "--"}"
         logText.text = if (lastLog != null) "Last log: Downloads/MOJODrive/$lastLog" else "Last log: --"
     }
 }
