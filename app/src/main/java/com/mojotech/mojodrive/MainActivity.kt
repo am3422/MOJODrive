@@ -72,7 +72,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.5 • GPS + IMU Fusion Camera Assistant"
+            text = "MVP 0.6 • Persistent Log + Adaptive Camera Alerts"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(12))
@@ -143,7 +143,7 @@ class MainActivity : Activity() {
         root.addView(sensorText)
 
         logText = TextView(this).apply {
-            text = "Last log: --"
+            text = "Trip log: --"
             textSize = 13f
             setTextColor(Color.GRAY)
             setPadding(0, dp(5), 0, dp(16))
@@ -172,7 +172,7 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(18) })
 
         root.addView(Button(this).apply {
-            text = "MARK / BUMP NOW"
+            text = "MARK ROAD EVENT"
             textSize = 16f
             setOnClickListener { markEvent() }
         }, LinearLayout.LayoutParams(
@@ -180,7 +180,7 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(8) })
 
         root.addView(Button(this).apply {
-            text = "STOP & SAVE LOG"
+            text = "STOP & FINALIZE LOG"
             textSize = 16f
             setOnClickListener { stopDrive() }
         }, LinearLayout.LayoutParams(
@@ -195,7 +195,7 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(8) })
 
         root.addView(TextView(this).apply {
-            text = "0.5 test: GPS + IMU fused speed, short GPS-gap dead reckoning, offline Shiraz speed + red-light cameras, carriageway direction filtering, automatic bump candidates and richer logs."
+            text = "0.6: the trip CSV is created in Downloads/MOJODrive as soon as START is pressed and is continuously flushed. If Android kills the service, the unfinished trip is recovered on restart. Camera alert cadence and loudness increase as time-to-camera falls."
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(16), 0, 0)
@@ -227,7 +227,7 @@ class MainActivity : Activity() {
         val intent = Intent(this, LocationService::class.java)
             .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
         startForegroundService(intent)
-        Toast.makeText(this, "MOJO Drive 0.5 started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.6 started.", Toast.LENGTH_SHORT).show()
         refreshUi()
     }
 
@@ -237,18 +237,22 @@ class MainActivity : Activity() {
             return
         }
         startService(Intent(this, LocationService::class.java).setAction(LocationService.ACTION_MARK_EVENT))
-        Toast.makeText(this, "Event marked in log.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "Road event marked.", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopDrive() {
-        stopService(Intent(this, LocationService::class.java))
-        prefs.edit().putBoolean("running", false).apply()
-        Toast.makeText(this, "Stopping and saving trip log…", Toast.LENGTH_SHORT).show()
+        if (!prefs.getBoolean("running", false) && !prefs.getBoolean("trip_active", false)) {
+            Toast.makeText(this, "No active trip.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startService(Intent(this, LocationService::class.java).setAction(LocationService.ACTION_STOP_TRIP))
+        Toast.makeText(this, "Finalizing persistent trip log…", Toast.LENGTH_SHORT).show()
         handler.postDelayed({ refreshUi() }, 1200)
     }
 
     private fun refreshUi() {
         val running = prefs.getBoolean("running", false)
+        val tripActive = prefs.getBoolean("trip_active", false)
         val speed = prefs.getFloat("speed_kmh", 0f)
         val lat = prefs.getString("lat", null)
         val lon = prefs.getString("lon", null)
@@ -264,6 +268,9 @@ class MainActivity : Activity() {
         val cameraType = prefs.getString("camera_type", "") ?: ""
         val roadBearing = prefs.getFloat("camera_road_bearing", -1f)
         val directionDelta = prefs.getFloat("camera_direction_delta", -1f)
+        val alertLevel = prefs.getInt("camera_alert_level", 0)
+        val warningDistance = prefs.getFloat("camera_warning_distance_m", -1f)
+        val ttc = prefs.getFloat("camera_ttc_s", -1f)
         val confidence = prefs.getString("camera_confidence", "") ?: ""
         val accel = prefs.getBoolean("accel_available", false)
         val gyro = prefs.getBoolean("gyro_available", false)
@@ -274,7 +281,7 @@ class MainActivity : Activity() {
         val gpsFiltered = prefs.getFloat("gps_filtered_kmh", -1f)
         val forwardAccel = prefs.getFloat("forward_accel_mps2", 0f)
         val cameraCount = prefs.getInt("camera_count", 0)
-        val lastLog = prefs.getString("last_log_name", null)
+        val liveLog = prefs.getString("active_log_name", null) ?: prefs.getString("last_log_name", null)
 
         speedText.text = String.format(Locale.US, "%.0f km/h", speed)
         speedText.setTextColor(if (running && !gpsStale && speed >= activeLimit + 1f) Color.rgb(210, 35, 35) else Color.rgb(20, 91, 210))
@@ -285,7 +292,8 @@ class MainActivity : Activity() {
         cameraText.text = if (cameraId.isNotEmpty() && cameraDistance >= 0f) {
             val road = if (cameraRoad.isNotBlank()) " • $cameraRoad" else ""
             val lim = if (cameraLimit > 0) " • $cameraLimit km/h" else ""
-            "${if (cameraType == "red_light") "Red-light camera" else "Speed camera"} $cameraId • ${cameraDistance.toInt()} m$lim$road${if (roadBearing >= 0f) " • road ${roadBearing.toInt()}°" else ""}${if (directionDelta >= 0f) " • Δ${directionDelta.toInt()}°" else ""}${if (confidence.isNotBlank()) " • $confidence" else ""}"
+            val adaptive = if (warningDistance > 0f) " • warn ${warningDistance.toInt()}m • L$alertLevel${if (ttc > 0) " • ${ttc.toInt()}s" else ""}" else ""
+            "${if (cameraType == "red_light") "Red-light camera" else "Speed camera"} $cameraId • ${cameraDistance.toInt()} m$lim$road$adaptive${if (roadBearing >= 0f) " • road ${roadBearing.toInt()}°" else ""}${if (directionDelta >= 0f) " • Δ${directionDelta.toInt()}°" else ""}${if (confidence.isNotBlank()) " • $confidence" else ""}"
         } else "Camera: --"
 
         gpsText.text = when {
@@ -298,9 +306,13 @@ class MainActivity : Activity() {
         }
         gpsText.setTextColor(if (gpsStale && running) Color.rgb(200, 60, 30) else Color.rgb(35, 120, 60))
 
-        statusText.text = if (running) "ACTIVE • $provider • $cameraCount Shiraz cameras loaded" else "Stopped"
+        statusText.text = when {
+            running -> "ACTIVE • $provider • $cameraCount cameras • LIVE LOG"
+            tripActive -> "Trip interrupted • persistent log waiting for recovery"
+            else -> "Stopped"
+        }
         coordsText.text = if (lat != null && lon != null) "Location: $lat, $lon" else "Location: --"
         sensorText.text = "Sensors: Accel ${if (accel) "OK" else "--"} • Gyro ${if (gyro) "OK" else "--"} • Linear ${if (linearAccel) "OK" else "--"} • Rotation ${if (rotationVector) "OK" else "--"}"
-        logText.text = if (lastLog != null) "Last log: Downloads/MOJODrive/$lastLog" else "Last log: --"
+        logText.text = if (liveLog != null) "Trip log: Downloads/MOJODrive/$liveLog" else "Trip log: --"
     }
 }

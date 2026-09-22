@@ -15,11 +15,13 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.net.Uri
 import android.os.*
 import android.provider.MediaStore
 import android.widget.Toast
+import java.io.BufferedWriter
 import java.io.File
-import java.io.FileInputStream
+import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
@@ -31,18 +33,22 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     companion object {
         const val EXTRA_THRESHOLD_KMH = "threshold_kmh"
         const val ACTION_MARK_EVENT = "com.mojotech.mojodrive.MARK_EVENT"
+        const val ACTION_STOP_TRIP = "com.mojotech.mojodrive.STOP_TRIP"
+
         private const val CHANNEL_ID = "mojo_drive_tracking"
         private const val NOTIFICATION_ID = 100
         private const val GPS_STALE_MS = 8000L
         private const val FUSION_BRIDGE_MS = 8000L
         private const val FUSION_MIN_SPEED_KMH = 5f
-        private const val BUMP_CANDIDATE_COOLDOWN_MS = 1200L
-        private const val BUMP_CANDIDATE_SHOCK_MPS2 = 3.2f
+        private const val ROAD_IMPACT_COOLDOWN_MS = 1200L
+        private const val ROAD_IMPACT_SHOCK_MPS2 = 3.2f
         private const val OVERSPEED_REPEAT_MS = 7000L
         private const val CAMERA_MAX_SEARCH_M = 1500f
         private const val ROAD_DIRECTION_MAX_DELTA_DEG = 45f
         private const val CAMERA_FORWARD_MAX_DELTA_DEG = 75f
         private const val DIRECTION_MIN_SPEED_KMH = 8f
+        private const val LIVE_LOG_FLUSH_MS = 1000L
+        private const val CAMERA_ALERT_LATERAL_MAX_M = 55f
     }
 
     private lateinit var locationManager: LocationManager
@@ -55,7 +61,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var linearAcceleration: Sensor? = null
     private var rotationVector: Sensor? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var tone: ToneGenerator? = null
+
+    // Three independent generators give an audible progression without changing the user's system volume.
+    private var toneLow: ToneGenerator? = null
+    private var toneMid: ToneGenerator? = null
+    private var toneHigh: ToneGenerator? = null
+
     private var cameras: List<CameraPoint> = emptyList()
 
     private val handler = Handler(Looper.getMainLooper())
@@ -63,6 +74,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private val cameraWarned = HashSet<String>()
     private val cameraUrgentWarned = HashSet<String>()
     private val rotationMatrix = FloatArray(9)
+
     private var rotationReady = false
     private var fusionInitialized = false
     private var fusionSpeedMps = 0f
@@ -72,7 +84,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var latestForwardAccelMps2 = 0f
     private var fusionActive = false
     private var imuBridgeActive = false
-    private var lastBumpCandidateElapsed = 0L
+    private var lastRoadImpactElapsed = 0L
 
     private var manualThresholdKmh = 80
     private var activeLimitKmh = 80
@@ -80,9 +92,22 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var overspeedActive = false
     private var lastOverspeedAlertElapsed = 0L
 
+    // Adaptive camera alert state.
+    private var cameraAlertLevel = 0
+    private var cameraWarningDistanceM = -1f
+    private var cameraTtcS = -1f
+    private var lastCameraPulseElapsed = 0L
+    private var lastLoggedCameraAlertLevel = -1
+    private var currentCameraKey = ""
+
+    // Persistent logging.
     private lateinit var logFile: File
     private lateinit var logName: String
     private var loggingStarted = false
+    private var userStopRequested = false
+    private var liveLogUri: Uri? = null
+    private var liveWriter: BufferedWriter? = null
+    private var lastLiveFlushElapsed = 0L
 
     @Volatile private var latestLat = Double.NaN
     @Volatile private var latestLon = Double.NaN
@@ -115,15 +140,22 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     override fun onCreate() {
         super.onCreate()
+
         prefs = getSharedPreferences("mojo_drive", MODE_PRIVATE)
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         linearAcceleration = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
         rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
+
+        // STREAM_ALARM is deliberately used because STREAM_NOTIFICATION was inaudible on the test phone.
+        // We never change the user's system volume.
+        toneLow = ToneGenerator(AudioManager.STREAM_ALARM, 55)
+        toneMid = ToneGenerator(AudioManager.STREAM_ALARM, 80)
+        toneHigh = ToneGenerator(AudioManager.STREAM_ALARM, 100)
 
         try {
             cameras = CameraDatabase(this).loadAll()
@@ -147,18 +179,36 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_MARK_EVENT) {
             if (loggingStarted) {
-                appendMarker("USER_EVENT")
+                appendMarker("USER_ROAD_EVENT")
                 vibratePattern(longArrayOf(0, 100), intArrayOf(0, 180))
             }
             return START_STICKY
         }
 
-        manualThresholdKmh = intent?.getIntExtra(EXTRA_THRESHOLD_KMH, prefs.getInt("threshold_kmh", 80))
-            ?: prefs.getInt("threshold_kmh", 80)
+        if (intent?.action == ACTION_STOP_TRIP) {
+            userStopRequested = true
+            if (loggingStarted || prefs.getBoolean("trip_active", false)) {
+                ensureTripLoadedForStop()
+                appendMarker("STOP")
+                finalizePersistentTrip()
+            }
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        manualThresholdKmh = intent?.getIntExtra(
+            EXTRA_THRESHOLD_KMH,
+            prefs.getInt("threshold_kmh", 80)
+        ) ?: prefs.getInt("threshold_kmh", 80)
+
         activeLimitKmh = manualThresholdKmh
         lastAlertLimitKmh = manualThresholdKmh
+        userStopRequested = false
 
-        if (!loggingStarted) startNewTripLog()
+        if (!loggingStarted) {
+            if (!resumeInterruptedTrip()) startNewTripLog()
+        }
 
         startForeground(NOTIFICATION_ID, makeNotification("Waiting for valid GPS…"))
         prefs.edit().putBoolean("running", true).apply()
@@ -170,25 +220,153 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private fun acquireWakeLock() {
         try {
-            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MOJODrive::Tracking").apply {
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "MOJODrive::Tracking"
+            ).apply {
                 setReferenceCounted(false)
                 acquire()
             }
         } catch (_: Exception) {}
     }
 
+    private fun csvHeader(): String =
+        "wall_time_ms,iso_time,record_type,lat,lon,provider,gps_age_ms,gps_stale,speed_valid," +
+            "raw_speed_kmh,gps_filtered_kmh,fused_speed_kmh,forward_accel_mps2,fusion_active,imu_bridge," +
+            "bearing_deg,bearing_valid,gps_accuracy_m,camera_id,camera_type,camera_distance_m,camera_limit_kmh," +
+            "camera_bearing_delta_deg,camera_road_bearing_deg,camera_direction_delta_deg,camera_lateral_m," +
+            "active_limit_kmh,camera_alert_level,camera_ttc_s,camera_warning_distance_m," +
+            "x,y,z,magnitude,sensor_timestamp_ns,details\n"
+
     private fun startNewTripLog() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         logName = "MOJODrive_Trip_$stamp.csv"
         logFile = File(filesDir, logName)
-        logFile.writeText(
-            "wall_time_ms,iso_time,record_type,lat,lon,provider,gps_age_ms,gps_stale,speed_valid," +
-                "raw_speed_kmh,gps_filtered_kmh,fused_speed_kmh,forward_accel_mps2,fusion_active,imu_bridge,bearing_deg,bearing_valid,gps_accuracy_m,camera_id," +
-                "camera_type,camera_distance_m,camera_limit_kmh,camera_bearing_delta_deg,camera_road_bearing_deg," +
-                "camera_direction_delta_deg,camera_lateral_m,active_limit_kmh,x,y,z,magnitude,sensor_timestamp_ns,details\n"
-        )
-        appendMarker("START")
+        logFile.writeText(csvHeader())
+
+        liveLogUri = createPublicLiveLog(logName)
+        openLiveWriter(append = false)
+        try {
+            liveWriter?.write(csvHeader())
+            liveWriter?.flush()
+        } catch (_: Exception) {}
+
+        prefs.edit()
+            .putBoolean("trip_active", true)
+            .putString("active_log_name", logName)
+            .putString("active_log_uri", liveLogUri?.toString())
+            .apply()
+
         loggingStarted = true
+        appendMarker("START", "persistent_live_log=true")
+    }
+
+    private fun resumeInterruptedTrip(): Boolean {
+        if (!prefs.getBoolean("trip_active", false)) return false
+        val name = prefs.getString("active_log_name", null) ?: return false
+        val internal = File(filesDir, name)
+        if (!internal.exists() || internal.length() == 0L) return false
+
+        logName = name
+        logFile = internal
+        liveLogUri = prefs.getString("active_log_uri", null)?.let {
+            try { Uri.parse(it) } catch (_: Exception) { null }
+        }
+
+        // If the public URI survived, rewrite it from the complete internal journal first.
+        // This repairs the last unflushed second after an abrupt process death.
+        if (liveLogUri != null) {
+            try {
+                contentResolver.openOutputStream(liveLogUri!!, "w")?.use { out ->
+                    logFile.inputStream().use { input -> input.copyTo(out) }
+                }
+            } catch (_: Exception) {
+                liveLogUri = null
+            }
+        }
+
+        if (liveLogUri == null) {
+            liveLogUri = createPublicLiveLog(logName)
+            if (liveLogUri != null) {
+                try {
+                    contentResolver.openOutputStream(liveLogUri!!, "w")?.use { out ->
+                        logFile.inputStream().use { input -> input.copyTo(out) }
+                    }
+                } catch (_: Exception) {}
+                prefs.edit().putString("active_log_uri", liveLogUri.toString()).apply()
+            }
+        }
+
+        openLiveWriter(append = true)
+        loggingStarted = true
+        appendMarker("RECOVERED_AFTER_RESTART", "previous_session_was_interrupted=true")
+        return true
+    }
+
+    private fun ensureTripLoadedForStop() {
+        if (loggingStarted) return
+        resumeInterruptedTrip()
+    }
+
+    private fun createPublicLiveLog(name: String): Uri? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, "text/csv")
+                put(
+                    MediaStore.Downloads.RELATIVE_PATH,
+                    Environment.DIRECTORY_DOWNLOADS + "/MOJODrive"
+                )
+            }
+            contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun openLiveWriter(append: Boolean) {
+        closeLiveWriter()
+        val uri = liveLogUri ?: return
+        try {
+            val mode = if (append) "wa" else "wa"
+            liveWriter = BufferedWriter(OutputStreamWriter(contentResolver.openOutputStream(uri, mode)!!))
+            lastLiveFlushElapsed = SystemClock.elapsedRealtime()
+        } catch (_: Exception) {
+            liveWriter = null
+        }
+    }
+
+    private fun closeLiveWriter() {
+        try { liveWriter?.flush() } catch (_: Exception) {}
+        try { liveWriter?.close() } catch (_: Exception) {}
+        liveWriter = null
+    }
+
+    private fun finalizePersistentTrip() {
+        if (!loggingStarted) {
+            prefs.edit()
+                .putBoolean("trip_active", false)
+                .putBoolean("running", false)
+                .apply()
+            return
+        }
+
+        closeLiveWriter()
+        prefs.edit()
+            .putBoolean("trip_active", false)
+            .putBoolean("running", false)
+            .putString("last_log_name", logName)
+            .remove("active_log_uri")
+            .remove("active_log_name")
+            .apply()
+
+        loggingStarted = false
+        Toast.makeText(
+            this,
+            "Trip log finalized: Downloads/MOJODrive/$logName",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     private fun startLocationUpdates() {
@@ -251,14 +429,26 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             val gpsSpeedAccuracyMps = if (Build.VERSION.SDK_INT >= 26 && location.hasSpeedAccuracy()) {
                 location.speedAccuracyMetersPerSecond.coerceIn(0.3f, 5.5f)
             } else 2.0f
+
             correctFusionWithGps(latestGpsFilteredKmh / 3.6f, gpsSpeedAccuracyMps)
             latestSpeedKmh = (fusionSpeedMps * 3.6f).coerceIn(0f, 250f)
 
             evaluateCameraTarget()
             handleOverspeed(latestSpeedKmh)
-            appendRow("GPS", Float.NaN, Float.NaN, Float.NaN, Float.NaN, 0L, true, "fusion=${if (fusionActive) "GPS_IMU" else "GPS"}")
+
+            appendRow(
+                "GPS",
+                Float.NaN, Float.NaN, Float.NaN, Float.NaN,
+                0L, true,
+                "fusion=${if (fusionActive) "GPS_IMU" else "GPS"}"
+            )
         } else {
-            appendRow("GPS_REJECTED", Float.NaN, Float.NaN, Float.NaN, Float.NaN, 0L, false, rejectionReason(location, ageMs, speedAccuracyOk))
+            appendRow(
+                "GPS_REJECTED",
+                Float.NaN, Float.NaN, Float.NaN, Float.NaN,
+                0L, false,
+                rejectionReason(location, ageMs, speedAccuracyOk)
+            )
         }
 
         updatePrefs()
@@ -277,7 +467,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private fun locationAgeMs(location: Location): Long {
         return if (location.elapsedRealtimeNanos > 0L) {
-            ((SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos) / 1_000_000L).coerceAtLeast(0L)
+            ((SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos) / 1_000_000L)
+                .coerceAtLeast(0L)
         } else 0L
     }
 
@@ -286,7 +477,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         while (speedSamples.size > 3) speedSamples.removeFirst()
         return speedSamples.sorted()[speedSamples.size / 2]
     }
-
 
     private fun correctFusionWithGps(gpsSpeedMps: Float, speedAccuracyMps: Float) {
         if (!fusionInitialized) {
@@ -324,10 +514,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val age = currentGpsAgeMs()
         if (age < 0L || age > FUSION_BRIDGE_MS) return
 
-        val a = when {
-            abs(forwardAccelMps2) < 0.08f -> 0f
-            else -> forwardAccelMps2.coerceIn(-8f, 8f)
-        }
+        val a = if (abs(forwardAccelMps2) < 0.08f) 0f else forwardAccelMps2.coerceIn(-8f, 8f)
 
         fusionSpeedMps = (fusionSpeedMps + a * dt).coerceIn(0f, 70f)
         fusionVariance = (fusionVariance + (0.7f * 0.7f * dt)).coerceAtMost(25f)
@@ -395,6 +582,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 latitude = camera.latitude
                 longitude = camera.longitude
             }
+
             val distance = from.distanceTo(to)
             if (distance > CAMERA_MAX_SEARCH_M) continue
 
@@ -437,6 +625,14 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         }
 
         val match = best!!
+        val newKey = "${match.camera.type}:${match.camera.id}"
+        if (newKey != currentCameraKey) {
+            currentCameraKey = newKey
+            cameraAlertLevel = 0
+            lastLoggedCameraAlertLevel = -1
+            lastCameraPulseElapsed = 0L
+        }
+
         activeCameraId = match.camera.id
         activeCameraType = match.camera.type
         activeCameraDistanceM = match.distanceM
@@ -445,33 +641,154 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         activeCameraBearingDelta = match.bearingDelta
         activeCameraLateralM = match.lateralM
         activeCameraRoadBearing = match.camera.roadBearing ?: -1f
-        activeCameraDirectionDelta = if (match.roadDirectionDelta < 999f) match.roadDirectionDelta else -1f
+        activeCameraDirectionDelta =
+            if (match.roadDirectionDelta < 999f) match.roadDirectionDelta else -1f
 
-        val speedMps = latestSpeedKmh / 3.6f
-        val warningSeconds = if (match.camera.type == "red_light") 18f else 25f
-        val urgentSeconds = if (match.camera.type == "red_light") 7f else 10f
-        val warningDistance = (speedMps * warningSeconds).coerceIn(350f, 1200f)
-        val urgentDistance = (speedMps * urgentSeconds).coerceIn(140f, 450f)
+        val candidateLimit =
+            if (match.camera.type == "speed") validDynamicLimit(match.camera) else null
 
-        val candidateLimit = if (match.camera.type == "speed") validDynamicLimit(match.camera) else null
-        activeCameraSpeedLimit = if (match.distanceM <= warningDistance) candidateLimit else null
+        val adaptiveWarningDistance = computeAdaptiveWarningDistanceM(
+            distanceM = match.distanceM,
+            speedKmh = latestSpeedKmh,
+            cameraLimitKmh = candidateLimit,
+            cameraType = match.camera.type
+        )
+        cameraWarningDistanceM = adaptiveWarningDistance
+
+        val speedMps = max(1.5f, latestSpeedKmh / 3.6f)
+        cameraTtcS = match.distanceM / speedMps
+
+        // A camera may be tracked loosely at long range, but audible alerts require a much
+        // tighter road corridor. This reduces parallel-road false warnings.
+        val alertCorridorOk = if (latestBearingValid) {
+            match.lateralM <= CAMERA_ALERT_LATERAL_MAX_M &&
+                match.bearingDelta <= CAMERA_FORWARD_MAX_DELTA_DEG &&
+                (match.roadDirectionDelta >= 999f || match.roadDirectionDelta <= ROAD_DIRECTION_MAX_DELTA_DEG)
+        } else {
+            match.distanceM <= 180f
+        }
+
+        val inWarningZone = match.distanceM <= adaptiveWarningDistance && alertCorridorOk
+        activeCameraSpeedLimit = if (inWarningZone) candidateLimit else null
         activeLimitKmh = activeCameraSpeedLimit ?: manualThresholdKmh
 
-        val warningKey = "${match.camera.type}:${match.camera.id}"
-        if (match.distanceM <= warningDistance && cameraWarned.add(warningKey)) {
-            cameraAlert(false, match.camera.type)
+        if (inWarningZone) {
+            val level = computeCameraAlertLevel(
+                distanceM = match.distanceM,
+                ttcS = cameraTtcS,
+                speedKmh = latestSpeedKmh,
+                cameraLimitKmh = candidateLimit
+            )
+            updateAdaptiveCameraAlert(level)
+
+            if (cameraWarned.add(newKey)) {
+                appendMarker(
+                    if (match.camera.type == "red_light") "RED_LIGHT_CAMERA_WARNING" else "CAMERA_WARNING",
+                    "id=${match.camera.id};distance=${match.distanceM.roundToInt()};warnDistance=${adaptiveWarningDistance.roundToInt()};limit=${candidateLimit ?: -1};lateral=${match.lateralM.roundToInt()}"
+                )
+            }
+
+            if (level >= 3 && cameraUrgentWarned.add(newKey)) {
+                appendMarker(
+                    if (match.camera.type == "red_light") "RED_LIGHT_CAMERA_URGENT" else "CAMERA_URGENT",
+                    "id=${match.camera.id};distance=${match.distanceM.roundToInt()};ttc=${String.format(Locale.US, "%.1f", cameraTtcS)};limit=${candidateLimit ?: -1}"
+                )
+            }
+        } else {
+            cameraAlertLevel = 0
+        }
+    }
+
+    private fun computeAdaptiveWarningDistanceM(
+        distanceM: Float,
+        speedKmh: Float,
+        cameraLimitKmh: Int?,
+        cameraType: String
+    ): Float {
+        val v = max(5f, speedKmh) / 3.6f
+
+        // Base lead time: 18 seconds at low/medium speed, rising toward 26 seconds at highway speed.
+        val baseLeadS = (18f + (speedKmh - 50f).coerceAtLeast(0f) * 0.10f)
+            .coerceIn(18f, 26f)
+        var warningM = v * baseLeadS
+
+        // If a trusted camera speed limit exists and the car is over it, add enough room for
+        // comfortable deceleration (~1.8 m/s²) plus a 4 s reaction/decision margin.
+        if (cameraLimitKmh != null && speedKmh > cameraLimitKmh) {
+            val target = cameraLimitKmh / 3.6f
+            val decelDistance = ((v * v - target * target) / (2f * 1.8f)).coerceAtLeast(0f)
+            val reactionDistance = v * 4f
+            warningM = max(warningM, decelDistance + reactionDistance + 60f)
+        }
+
+        if (cameraType == "red_light") warningM = max(warningM, v * 20f)
+
+        return warningM.coerceIn(300f, 1200f)
+    }
+
+    private fun computeCameraAlertLevel(
+        distanceM: Float,
+        ttcS: Float,
+        speedKmh: Float,
+        cameraLimitKmh: Int?
+    ): Int {
+        val overLimit = cameraLimitKmh != null && speedKmh > cameraLimitKmh + 2f
+
+        return when {
+            (ttcS <= 5.0f || distanceM <= 120f) && overLimit -> 4
+            ttcS <= 7.5f || distanceM <= 180f -> 3
+            ttcS <= 12f || distanceM <= 350f -> 2
+            else -> 1
+        }
+    }
+
+    private fun updateAdaptiveCameraAlert(level: Int) {
+        cameraAlertLevel = level.coerceIn(0, 4)
+
+        if (cameraAlertLevel != lastLoggedCameraAlertLevel) {
+            lastLoggedCameraAlertLevel = cameraAlertLevel
             appendMarker(
-                if (match.camera.type == "red_light") "RED_LIGHT_CAMERA_WARNING" else "CAMERA_WARNING",
-                "id=${match.camera.id};distance=${match.distanceM.roundToInt()};limit=${activeCameraSpeedLimit ?: -1};roadBearing=${match.camera.roadBearing ?: -1};directionDelta=${activeCameraDirectionDelta}"
+                "CAMERA_ALERT_LEVEL",
+                "level=$cameraAlertLevel;distance=${activeCameraDistanceM.roundToInt()};ttc=${String.format(Locale.US, "%.1f", cameraTtcS)};warningDistance=${cameraWarningDistanceM.roundToInt()};limit=${activeCameraSpeedLimit ?: -1}"
             )
         }
 
-        if (match.distanceM <= urgentDistance && cameraUrgentWarned.add(warningKey)) {
-            cameraAlert(true, match.camera.type)
-            appendMarker(
-                if (match.camera.type == "red_light") "RED_LIGHT_CAMERA_URGENT" else "CAMERA_URGENT",
-                "id=${match.camera.id};distance=${match.distanceM.roundToInt()};limit=${activeCameraSpeedLimit ?: -1};roadBearing=${match.camera.roadBearing ?: -1};directionDelta=${activeCameraDirectionDelta}"
-            )
+        val now = SystemClock.elapsedRealtime()
+        val interval = when (cameraAlertLevel) {
+            1 -> 3500L
+            2 -> 2000L
+            3 -> 1000L
+            4 -> 500L
+            else -> Long.MAX_VALUE
+        }
+
+        if (cameraAlertLevel > 0 && now - lastCameraPulseElapsed >= interval) {
+            lastCameraPulseElapsed = now
+            cameraPulse(cameraAlertLevel)
+        }
+    }
+
+    private fun cameraPulse(level: Int) {
+        when (level) {
+            1 -> {
+                toneLow?.startTone(ToneGenerator.TONE_PROP_BEEP, 110)
+                vibratePattern(longArrayOf(0, 70), intArrayOf(0, 110))
+            }
+            2 -> {
+                toneMid?.startTone(ToneGenerator.TONE_PROP_BEEP2, 150)
+                vibratePattern(longArrayOf(0, 100), intArrayOf(0, 170))
+            }
+            3 -> {
+                toneHigh?.startTone(ToneGenerator.TONE_PROP_BEEP2, 220)
+                vibratePattern(longArrayOf(0, 130), intArrayOf(0, 220))
+            }
+            4 -> {
+                toneHigh?.startTone(ToneGenerator.TONE_PROP_BEEP2, 340)
+                vibratePattern(
+                    longArrayOf(0, 190, 70, 190),
+                    intArrayOf(0, 255, 0, 255)
+                )
+            }
         }
     }
 
@@ -496,6 +813,10 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         activeCameraDirectionDelta = -1f
         activeCameraLateralM = -1f
         activeLimitKmh = manualThresholdKmh
+        cameraAlertLevel = 0
+        cameraWarningDistanceM = -1f
+        cameraTtcS = -1f
+        currentCameraKey = ""
     }
 
     private fun angleDifference(a: Float, b: Float): Float {
@@ -517,36 +838,25 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             if (!overspeedActive || now - lastOverspeedAlertElapsed >= OVERSPEED_REPEAT_MS) {
                 overspeedActive = true
                 lastOverspeedAlertElapsed = now
-                overspeedAlert()
-                appendMarker("OVERSPEED_ALERT", "speed=${speedKmh.roundToInt()};limit=$activeLimitKmh;camera=$activeCameraId")
+
+                // Camera zones already have a much faster adaptive cadence.
+                if (cameraAlertLevel == 0) overspeedAlert()
+
+                appendMarker(
+                    "OVERSPEED_ALERT",
+                    "speed=${speedKmh.roundToInt()};limit=$activeLimitKmh;camera=$activeCameraId"
+                )
             }
         } else if (speedKmh <= activeLimitKmh - 4f) {
             overspeedActive = false
         }
     }
 
-    private fun cameraAlert(urgent: Boolean, cameraType: String) {
-        val duration = if (cameraType == "red_light") { if (urgent) 1000 else 650 } else { if (urgent) 850 else 500 }
-        val toneId = if (cameraType == "red_light") ToneGenerator.TONE_PROP_ACK else ToneGenerator.TONE_PROP_BEEP2
-        tone?.startTone(toneId, duration)
-        if (urgent) {
-            vibratePattern(
-                longArrayOf(0, 300, 110, 300, 110, 420),
-                intArrayOf(0, 255, 0, 255, 0, 255)
-            )
-        } else {
-            vibratePattern(
-                longArrayOf(0, 190, 100, 190),
-                intArrayOf(0, 220, 0, 220)
-            )
-        }
-    }
-
     private fun overspeedAlert() {
-        tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 1000)
+        toneHigh?.startTone(ToneGenerator.TONE_PROP_BEEP2, 500)
         vibratePattern(
-            longArrayOf(0, 450, 120, 450, 120, 550),
-            intArrayOf(0, 255, 0, 255, 0, 255)
+            longArrayOf(0, 300, 100, 300),
+            intArrayOf(0, 255, 0, 255)
         )
     }
 
@@ -596,9 +906,22 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
             val shock = abs(magnitude - SensorManager.GRAVITY_EARTH)
             val now = SystemClock.elapsedRealtime()
-            if (latestSpeedKmh >= 8f && shock >= BUMP_CANDIDATE_SHOCK_MPS2 && now - lastBumpCandidateElapsed >= BUMP_CANDIDATE_COOLDOWN_MS) {
-                lastBumpCandidateElapsed = now
-                appendMarker("BUMP_CANDIDATE", "shock=${String.format(Locale.US, "%.2f", shock)};speed=${String.format(Locale.US, "%.1f", latestSpeedKmh)}")
+            if (
+                latestSpeedKmh >= 8f &&
+                shock >= ROAD_IMPACT_SHOCK_MPS2 &&
+                now - lastRoadImpactElapsed >= ROAD_IMPACT_COOLDOWN_MS
+            ) {
+                lastRoadImpactElapsed = now
+                val severity = when {
+                    shock >= 7.0f -> "severe"
+                    shock >= 5.0f -> "strong"
+                    shock >= 4.0f -> "medium"
+                    else -> "light"
+                }
+                appendMarker(
+                    "ROAD_IMPACT_CANDIDATE",
+                    "shock=${String.format(Locale.US, "%.2f", shock)};speed=${String.format(Locale.US, "%.1f", latestSpeedKmh)};severity=$severity"
+                )
             }
         }
 
@@ -610,7 +933,11 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     @Synchronized
     private fun appendMarker(marker: String, details: String = "") {
         if (!::logFile.isInitialized) return
-        appendRow(marker, Float.NaN, Float.NaN, Float.NaN, Float.NaN, 0L, !gpsStale, details)
+        appendRow(
+            marker,
+            Float.NaN, Float.NaN, Float.NaN, Float.NaN,
+            0L, !gpsStale, details
+        )
     }
 
     @Synchronized
@@ -642,6 +969,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val cameraRoadBearing = if (activeCameraRoadBearing >= 0f) String.format(Locale.US, "%.2f", activeCameraRoadBearing) else ""
         val cameraDirectionDelta = if (activeCameraDirectionDelta >= 0f) String.format(Locale.US, "%.2f", activeCameraDirectionDelta) else ""
         val cameraLateral = if (activeCameraLateralM >= 0f) String.format(Locale.US, "%.2f", activeCameraLateralM) else ""
+        val ttc = if (cameraTtcS >= 0f) String.format(Locale.US, "%.2f", cameraTtcS) else ""
+        val warningDistance = if (cameraWarningDistanceM >= 0f) String.format(Locale.US, "%.1f", cameraWarningDistanceM) else ""
         val sx = if (x.isNaN()) "" else String.format(Locale.US, "%.6f", x)
         val sy = if (y.isNaN()) "" else String.format(Locale.US, "%.6f", y)
         val sz = if (z.isNaN()) "" else String.format(Locale.US, "%.6f", z)
@@ -650,13 +979,29 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val row = listOf(
             wall.toString(), iso, recordType, lat, lon, latestProvider,
             gpsAge.toString(), gpsStale.toString(), speedValid.toString(), rawSpeed,
-            gpsFiltered, fusedSpeed, forwardAccel, fusionActive.toString(), imuBridgeActive.toString(), bearing,
-            latestBearingValid.toString(), String.format(Locale.US, "%.2f", latestAccuracy),
-            activeCameraId, activeCameraType, cameraDistance, cameraLimit, cameraDelta, cameraRoadBearing, cameraDirectionDelta, cameraLateral,
-            activeLimitKmh.toString(), sx, sy, sz, sm, sensorTimestampNs.toString(), details
+            gpsFiltered, fusedSpeed, forwardAccel, fusionActive.toString(), imuBridgeActive.toString(),
+            bearing, latestBearingValid.toString(), String.format(Locale.US, "%.2f", latestAccuracy),
+            activeCameraId, activeCameraType, cameraDistance, cameraLimit, cameraDelta,
+            cameraRoadBearing, cameraDirectionDelta, cameraLateral, activeLimitKmh.toString(),
+            cameraAlertLevel.toString(), ttc, warningDistance,
+            sx, sy, sz, sm, sensorTimestampNs.toString(), details
         ).joinToString(",") { csvEscape(it) }
 
-        try { logFile.appendText(row + "\n") } catch (_: Exception) {}
+        val line = row + "\n"
+
+        // Internal journal: each append opens/writes/closes, so it survives abrupt process death
+        // much better than waiting for STOP.
+        try { logFile.appendText(line) } catch (_: Exception) {}
+
+        // Public live CSV: visible in Downloads during the trip and flushed every ~1 second.
+        try {
+            liveWriter?.write(line)
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastLiveFlushElapsed >= LIVE_LOG_FLUSH_MS) {
+                liveWriter?.flush()
+                lastLiveFlushElapsed = now
+            }
+        } catch (_: Exception) {}
     }
 
     private fun csvEscape(s: String): String {
@@ -689,56 +1034,35 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             .putString("camera_confidence", activeCameraConfidence)
             .putFloat("camera_road_bearing", activeCameraRoadBearing)
             .putFloat("camera_direction_delta", activeCameraDirectionDelta)
+            .putInt("camera_alert_level", cameraAlertLevel)
+            .putFloat("camera_warning_distance_m", cameraWarningDistanceM)
+            .putFloat("camera_ttc_s", cameraTtcS)
             .apply()
     }
 
     private fun updateNotification() {
         val cameraPart = if (activeCameraId.isNotEmpty() && activeCameraDistanceM >= 0f) {
-            " • ${if (activeCameraType == "red_light") "red-light" else "camera"} ${activeCameraDistanceM.roundToInt()}m"
+            " • ${if (activeCameraType == "red_light") "red-light" else "camera"} ${activeCameraDistanceM.roundToInt()}m L$cameraAlertLevel"
         } else ""
+
         val gpsPart = when {
             gpsStale -> " • GPS stale"
             imuBridgeActive -> " • IMU bridge"
             fusionActive -> " • GPS+IMU"
             else -> ""
         }
-        val text = String.format(Locale.US, "%.0f km/h • limit %d%s%s", latestSpeedKmh, activeLimitKmh, cameraPart, gpsPart)
+
+        val text = String.format(
+            Locale.US,
+            "%.0f km/h • limit %d%s%s",
+            latestSpeedKmh,
+            activeLimitKmh,
+            cameraPart,
+            gpsPart
+        )
+
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, makeNotification(text))
-    }
-
-    private fun exportLogToDownloads() {
-        if (!::logFile.isInitialized || !logFile.exists()) return
-        try {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, logName)
-                    put(MediaStore.Downloads.MIME_TYPE, "text/csv")
-                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/MOJODrive")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    resolver.openOutputStream(uri)?.use { out ->
-                        FileInputStream(logFile).use { input -> input.copyTo(out) }
-                    }
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                }
-            } else {
-                val dir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
-                if (dir != null) {
-                    val outDir = File(dir, "MOJODrive").apply { mkdirs() }
-                    logFile.copyTo(File(outDir, logName), overwrite = true)
-                }
-            }
-            prefs.edit().putString("last_log_name", logName).apply()
-            Toast.makeText(this, "Trip log saved: Downloads/MOJODrive/$logName", Toast.LENGTH_LONG).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Could not export trip log: ${e.message}", Toast.LENGTH_LONG).show()
-        }
     }
 
     private fun makeNotification(text: String): Notification {
@@ -747,8 +1071,9 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             this, 0, openApp,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("MOJO Drive active")
+            .setContentTitle("MOJO Drive active • persistent logging")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
@@ -762,7 +1087,9 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 CHANNEL_ID,
                 "Driving tracking",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "Keeps MOJO Drive active while the phone is locked." }
+            ).apply {
+                description = "Keeps MOJO Drive active while the phone is locked."
+            }
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
                 .createNotificationChannel(channel)
         }
@@ -773,18 +1100,34 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     override fun onDestroy() {
         handler.removeCallbacks(staleTicker)
+
         try { locationManager.removeUpdates(this) } catch (_: Exception) {}
         try { sensorManager.unregisterListener(this) } catch (_: Exception) {}
 
-        if (loggingStarted) {
-            appendMarker("STOP")
-            exportLogToDownloads()
-            loggingStarted = false
+        if (loggingStarted && !userStopRequested) {
+            appendMarker("SERVICE_INTERRUPTED", "trip_will_be_recovered=true")
+            try { liveWriter?.flush() } catch (_: Exception) {}
+            closeLiveWriter()
+
+            // Deliberately DO NOT clear trip_active. The internal journal + public file survive.
+            prefs.edit()
+                .putBoolean("running", false)
+                .putBoolean("trip_active", true)
+                .putString("active_log_name", logName)
+                .putString("active_log_uri", liveLogUri?.toString())
+                .apply()
         }
 
         try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
-        tone?.release()
-        prefs.edit().putBoolean("running", false).apply()
+
+        try { toneLow?.release() } catch (_: Exception) {}
+        try { toneMid?.release() } catch (_: Exception) {}
+        try { toneHigh?.release() } catch (_: Exception) {}
+
+        if (userStopRequested) {
+            prefs.edit().putBoolean("running", false).apply()
+        }
+
         super.onDestroy()
     }
 

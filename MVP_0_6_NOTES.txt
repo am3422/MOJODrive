@@ -1,0 +1,33 @@
+MOJO Drive MVP 0.6 patch
+========================
+
+Main changes:
+1) Persistent live trip logging
+   - CSV is created in Downloads/MOJODrive immediately at START.
+   - Internal journal is written continuously.
+   - Public CSV is flushed roughly once per second.
+   - If the service/process is killed, trip_active remains true.
+   - The next service start recovers the same trip, repairs the public CSV from the internal journal,
+     and adds RECOVERED_AFTER_RESTART.
+   - User STOP now explicitly finalizes the trip.
+
+2) Audible adaptive camera alert
+   - Uses STREAM_ALARM, because STREAM_NOTIFICATION was inaudible on the test phone.
+   - Three ToneGenerator levels: 55 / 80 / 100.
+   - Alert cadence increases: ~3.5 s -> 2.0 s -> 1.0 s -> 0.5 s.
+   - Vibration grows with alert level.
+   - Does not modify Android system volume.
+
+3) Speed-aware early warning
+   - Base lead time 18–26 seconds based on vehicle speed.
+   - Warning distance is clamped to 300–1200 m.
+   - If a trusted camera speed limit exists and vehicle speed is over it, the algorithm estimates
+     comfortable deceleration distance (~1.8 m/s²) + 4 s reaction/decision margin + 60 m buffer.
+   - A tight <=55 m lateral road corridor is required before audible alerts, reducing parallel-road false warnings.
+
+4) Road surface intelligence groundwork
+   - BUMP_CANDIDATE renamed to ROAD_IMPACT_CANDIDATE.
+   - Adds severity: light / medium / strong / severe.
+
+Safety:
+The warning system is intended to help the driver comply with posted limits, not to encourage speeding.
