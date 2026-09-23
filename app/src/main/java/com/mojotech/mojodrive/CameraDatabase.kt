@@ -22,7 +22,9 @@ data class CameraPoint(
 )
 
 class CameraDatabase(private val context: Context) {
-    private val dbFile = File(context.filesDir, "shiraz_cameras_v04.sqlite")
+    // New file name forces an app upgrade to refresh the bundled database rather than
+    // silently continuing to use an older copied DB from a previous MVP build.
+    private val dbFile = File(context.filesDir, "shiraz_cameras_v07.sqlite")
 
     private fun ensureDatabase() {
         if (dbFile.exists() && dbFile.length() > 0) return

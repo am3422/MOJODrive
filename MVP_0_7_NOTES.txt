@@ -1,0 +1,56 @@
+MOJO Drive MVP 0.7
+==================
+
+Camera engine rewrite after real-road false-positive / missed-camera tests.
+
+Key fixes
+---------
+1. Multi-camera tracking
+   - No longer keeps only one active raw candidate.
+   - Every nearby camera has an independent state.
+
+2. Camera road matching
+   - Uses camera roadBearing when available.
+   - For two-way roads, automatically chooses roadBearing or roadBearing+180 that matches travel direction.
+   - Projects vehicle->camera onto the camera road tangent:
+       along-road distance
+       cross-track distance
+   - Requires 3 consecutive valid matches before confirmation.
+   - Strict cross-track corridor incorporates GPS accuracy but is capped at 38 m.
+   - Confirmed matches have limited hysteresis so small GPS noise does not drop a real camera.
+
+3. Parallel-road false alerts
+   - Raw candidates are hidden from the driver.
+   - UI and notification show only CONFIRMED cameras.
+   - A camera 80–120 m away on a parallel road should remain a diagnostic candidate only, not a driver warning.
+
+4. No warning after passing
+   - Camera road-line projection detects when the camera is behind the car.
+   - Two consecutive behind-camera fixes mark CAMERA_PASSED and stop output.
+
+5. Earlier warning
+   - Warning lead time increased to 22–30 s based on speed.
+   - Minimum warning distance 400 m, maximum 1200 m.
+   - If a trusted camera speed limit exists and speed is high, braking/reaction distance expands warning range.
+
+6. Miss diagnostics
+   - CAMERA_MATCH_DIAG logs why a nearby camera was not confirmed:
+       cross_track / heading / not_ahead / not_approaching / waiting_confirm_hits
+   - CAMERA_MATCH_CONFIRMED explicitly logs successful road match.
+   - CAMERA_MATCH_LOST and CAMERA_MISSED_DIAGNOSTIC help diagnose future misses.
+
+7. Beep / vibration verification
+   - Every camera pulse writes ALERT_OUTPUT to CSV.
+   - tone_start_ok records ToneGenerator.startTone() return value.
+   - vibrator_present and vibration_dispatched record vibration command status.
+   - This verifies Android accepted/dispatched the command; software cannot directly prove physical speaker/vibrator output.
+   - New TEST SOUND + VIBRATION button for pre-drive testing.
+
+8. Fresh camera DB copy
+   - Internal copied database name changed to shiraz_cameras_v07.sqlite so an app upgrade copies the current bundled DB instead of reusing an older internal copy.
+
+9. Persistent logging retained
+   - Live Downloads CSV + internal journal + restart recovery remain from MVP 0.6.
+
+10. Road surface logging retained
+   - ROAD_IMPACT_CANDIDATE remains active for potholes, bumps, asphalt defects and other impacts.
