@@ -1,0 +1,80 @@
+MOJO Drive MVP 0.8
+==================
+
+This build fixes the camera-engine regression found in the 2026-09-24 road test.
+
+Root cause found in 0.7
+-----------------------
+0.7 used camera roadBearing as if it were a guaranteed forward arrow. In the real logs,
+several physical camera passes had excellent cross-track distance but roadBearing was reversed
+relative to travel, so the engine calculated "along < 0" and classified real cameras as "not ahead".
+That prevented every CAMERA_MATCH_CONFIRMED and therefore every camera ALERT_OUTPUT.
+
+0.8 camera matching
+-------------------
+1. roadBearing is now an UNDIRECTED ROAD AXIS.
+   - rb and rb+180 are equivalent.
+   - It is used for same-road cross-track and road-axis alignment only.
+   - It can no longer flip a real camera behind the vehicle by itself.
+
+2. Ahead/behind is now determined from actual GPS travel bearing.
+   - bearing from phone position to camera
+   - forward delta versus phone/GPS bearing
+   - forward projection is independent of DB direction metadata.
+
+3. Distance trend is independent evidence.
+   - Each camera tracks whether straight-line distance is shrinking or growing.
+   - A real approach can confirm a camera even if DB direction metadata is imperfect.
+
+4. Multi-camera independent states remain.
+   - One candidate cannot replace/drop another real camera.
+
+5. Better cross-track compromise from actual logs.
+   - 0.7 max ~38 m was too strict.
+   - Real road-test candidates showed plausible real passes around ~50–68 m.
+   - Confirm corridor is now dynamic ~52–70 m depending on GPS accuracy.
+   - The known false parallel-road case at ~80–120 m remains outside the allowed corridor.
+
+6. Confirmation now uses a score + repeated evidence.
+   - road-axis cross-track
+   - road-axis heading alignment
+   - actual forward direction
+   - actual approach trend
+   - GPS accuracy
+   - two consecutive confirmation hits
+
+7. Robust passed detection.
+   - Uses actual vehicle bearing + distance growing after closest approach.
+   - Does not trust DB roadBearing direction for pass detection.
+
+8. Earlier warnings retained/improved.
+   - 23–31 s lead time
+   - minimum 420 m
+   - maximum 1250 m
+   - extra braking distance if a trusted camera limit exists and current speed is above it
+   - +90 m threshold margin to avoid edge misses
+
+9. Complete camera audit trail.
+   - CAMERA_MATCH_DIAG
+   - CAMERA_MATCH_CONFIRMED
+   - CAMERA_WARNING
+   - CAMERA_URGENT
+   - ALERT_OUTPUT
+   - CAMERA_NEAR_PASS_AUDIT
+   - CAMERA_PASSED
+   - CAMERA_MISSED_DIAGNOSTIC
+
+10. ALERT_OUTPUT now logs:
+    - tone_start_ok
+    - vibrator_present
+    - vibration_dispatched
+    - alarm_volume
+    - alarm_max
+    - alert level
+    - camera position + vehicle position
+    - camera geometry / score
+
+11. Fresh DB copy
+    - copies bundled DB into shiraz_cameras_v08.sqlite after app upgrade.
+
+12. Persistent trip logging + IMU road-impact logging are preserved.
