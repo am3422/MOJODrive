@@ -1,0 +1,47 @@
+MOJO Drive MVP 0.9
+==================
+
+Changes driven by the real 0.8 field logs:
+
+1. Severe cross-track is now a HARD reject and can never be rescued by score.
+   The hard corridor expands with distance to tolerate curved roads, but remains capped.
+
+2. Confidence is distance-dependent.
+   Far cameras require stronger geometry and more repeated hits.
+   Near cameras with strong approach history can fast-confirm.
+
+3. Duplicate DB cameras are clustered by physical proximity + direction compatibility + type.
+   One physical cluster produces one tracking state and one alert.
+
+4. Confirmed/Lost/Reconfirmed thrashing is removed.
+   State flow is TRACKING -> CONFIRMED -> PASSED/ABANDONED.
+   A confirmed camera never falls back to TRACKING during the same encounter.
+
+5. Global alert arbitration:
+   all camera requests are collected, but only the highest-priority camera may beep/vibrate per pulse.
+
+6. Raw ACCEL/GYRO CSV rows are removed.
+   Sensors are still processed internally up to about 50 Hz.
+   Road impacts are still logged, and SENSOR_HEALTH is written only every 10 seconds.
+
+7. Earlier confirmation:
+   strong close candidates with established approach history can fast-track,
+   reducing late warnings such as camera 14314.
+
+8. Short GPS dropout bridge:
+   already-confirmed cameras continue warning for roughly 1.5–7 s of GPS loss
+   using fused speed. No new camera can confirm during the bridge.
+
+Key diagnostics:
+CAMERA_MATCH_DIAG
+CAMERA_MATCH_CONFIRMED
+CAMERA_WARNING
+CAMERA_URGENT
+ALERT_OUTPUT
+CAMERA_NEAR_PASS_AUDIT
+CAMERA_PASSED
+CAMERA_MISSED_DIAGNOSTIC
+CAMERA_ABANDONED
+CAMERA_GPS_BRIDGE_START
+SENSOR_HEALTH
+ROAD_IMPACT_CANDIDATE
