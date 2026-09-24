@@ -1,0 +1,88 @@
+MOJO Drive MVP 0.10
+===================
+
+This build is based directly on the 0.9 field log MOJODrive_Trip_20260924_210603.csv.
+
+Primary fixes
+-------------
+1. LOCATION and SPEED validity are now independent.
+   - Good GPS coordinates are accepted even when Android reports POOR_SPEED_ACCURACY.
+   - Camera matching runs on every good location fix.
+   - Bad speed measurements do not contaminate the speed filter.
+   - A weak position-derived speed estimate keeps timing usable until good GNSS speed returns.
+
+2. Long speed gaps now hard-resync the fusion filter.
+   - Old median samples are cleared after a gap.
+   - First good GNSS speed after a long gap resets fusion instead of slowly dragging a stale speed estimate.
+
+3. GPS callback watchdog + GNSS diagnostics.
+   - If GPS callbacks stall, the service re-registers GPS updates with a cooldown.
+   - GNSS satellite count / used-in-fix count are logged.
+   - SENSOR_HEALTH now includes callback age, location age, speed age and watchdog count.
+
+4. Confirmed-camera GPS bridge expanded to 25 seconds.
+   - Only already-CONFIRMED cameras are bridged.
+   - No new camera is confirmed from dead reckoning.
+   - If GPS comes back after the camera is behind the car, the app logs the miss and DOES NOT beep late.
+
+5. Curve-aware hard geometry replaces the old straight-tangent hard cross-track gate.
+   - curveCross = min(vehicle-path cross, camera-road tangent cross).
+   - Severe curveCross is still a HARD reject and score cannot rescue it.
+   - Limits tighten as the camera gets closer.
+
+6. Direction is now a hard gate, not just a score contribution.
+   - Far cameras require strong forward alignment.
+   - Reliable one-way road bearing uses DIRECTED angle, not only undirected road-axis angle.
+   - This rejects opposite-direction records which could previously look geometrically valid.
+
+7. Distance-dependent confidence remains, but cannot override hard geometry.
+   - Far cameras need more repeated hits.
+   - Near, strongly approaching cameras can still fast-confirm.
+
+8. Guaranteed first camera alert.
+   - Global arbitration can no longer suppress a newly warned camera for tens of seconds.
+   - Every physical camera cluster keeps a pending first alert until it is actually output.
+   - Arbitration still controls repeat pulses.
+
+9. Duplicate clustering improved.
+   - Base clustering remains conservative.
+   - Extended 110 m clustering is allowed only when type, road direction/axis, speed-limit metadata and road name do not conflict.
+   - Opposite reliable one-way directions are NOT merged.
+
+10. Recovery after long GPS gaps no longer creates fake huge approach deltas.
+    - Tracking hit history is reset after location recovery.
+    - Confirmed state remains sticky but transient approach/away counters are reset.
+
+11. Road-impact stale-location bug fixed.
+    - Fresh location: ROAD_IMPACT_CANDIDATE with coordinates.
+    - Stale location: ROAD_IMPACT_UNLOCATED with location fields blank.
+
+12. Background robustness.
+    - Foreground service keeps stopWithTask=false.
+    - onTaskRemoved requests service continuation when a trip is active.
+    - UI includes Battery Optimization settings shortcut for field testing.
+
+Logging
+-------
+Raw ACCEL/GYRO rows remain disabled.
+New useful fields/events include:
+- gps_age_ms (valid LOCATION age)
+- gps_speed_age_ms
+- gps_callback_age_ms
+- derived_speed_kmh
+- gnss_satellites / gnss_used_in_fix
+- camera_curve_cross_m
+- camera_direction_delta_deg
+- camera_hard_geometry_ok
+- GPS_LOCATION_ONLY
+- GPS_LOCATION_REJECTED
+- GPS_WATCHDOG_REREGISTER
+- GPS_LOCATION_RECOVERED
+- CAMERA_MISSED_DURING_GPS_GAP
+- CAMERA_PREDICTED_PASS_DURING_GPS_GAP
+- ALERT_OUTPUT first_alert=true/false
+- ROAD_IMPACT_UNLOCATED
+
+Important field-test setup
+--------------------------
+Before the drive, open Battery Optimization settings from the app and set MOJO Drive to unrestricted / not optimized if the phone offers that option. This matters especially on aggressive OEM Android builds.

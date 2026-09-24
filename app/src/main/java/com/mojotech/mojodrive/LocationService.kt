@@ -10,6 +10,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.location.GnssStatus
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -39,32 +40,35 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         private const val CHANNEL_ID = "mojo_drive_tracking"
         private const val NOTIFICATION_ID = 100
 
-        private const val GPS_STALE_MS = 8000L
+        private const val LOCATION_STALE_MS = 8000L
+        private const val LOCATION_RECOVERY_RESET_MS = 3000L
         private const val GPS_CAMERA_BRIDGE_START_MS = 1500L
-        private const val GPS_CAMERA_BRIDGE_MAX_MS = 7000L
-        private const val FUSION_BRIDGE_MS = 8000L
+        private const val GPS_CAMERA_BRIDGE_MAX_MS = 25_000L
+        private const val FUSION_BRIDGE_MS = 15_000L
+        private const val BEARING_HOLD_MS = 8000L
+
+        private const val GPS_CALLBACK_WATCHDOG_MS = 4000L
+        private const val GPS_WATCHDOG_COOLDOWN_MS = 10_000L
 
         private const val ROAD_IMPACT_COOLDOWN_MS = 1200L
         private const val ROAD_IMPACT_SHOCK_MPS2 = 3.2f
-
         private const val OVERSPEED_REPEAT_MS = 7000L
 
-        private const val CAMERA_SEARCH_M = 2200f
-        private const val CAMERA_CONFIRM_EXTRA_M = 450f
-        private const val CAMERA_CLUSTER_DISTANCE_M = 40f
-        private const val CAMERA_CLUSTER_AXIS_DELTA_DEG = 30f
-        private const val CAMERA_CLUSTER_DIRECTED_DELTA_DEG = 38f
-
-        private const val CAMERA_SOFT_CROSS_BASE_M = 48f
-        private const val CAMERA_SOFT_CROSS_MAX_M = 72f
-        private const val CAMERA_DIAG_NEAR_M = 900f
+        private const val CAMERA_SEARCH_M = 2300f
+        private const val CAMERA_CONFIRM_EXTRA_M = 500f
+        private const val CAMERA_CLUSTER_BASE_M = 40f
+        private const val CAMERA_CLUSTER_EXTENDED_M = 110f
+        private const val CAMERA_CLUSTER_AXIS_DELTA_DEG = 18f
+        private const val CAMERA_CLUSTER_DIRECTED_DELTA_DEG = 22f
+        private const val CAMERA_DIAG_NEAR_M = 950f
         private const val CAMERA_DIAG_INTERVAL_MS = 5000L
 
         private const val PASS_BEHIND_DEG = 100f
         private const val PASS_DISTANCE_GROWTH_M = 25f
         private const val NEAR_PASS_AUDIT_M = 140f
 
-        private const val GLOBAL_ALERT_SWITCH_MIN_MS = 650L
+        private const val GLOBAL_ALERT_MIN_GAP_MS = 350L
+        private const val FIRST_ALERT_FORCE_MS = 1200L
 
         private const val SENSOR_PROCESS_PERIOD_NS = 20_000_000L
         private const val SENSOR_HEALTH_LOG_MS = 10_000L
@@ -89,10 +93,13 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val bearingToCameraDeg: Float,
         val forwardDeltaDeg: Float,
         val roadCrossM: Float,
+        val curveCrossM: Float,
         val roadAxisDeltaDeg: Float,
-        val softCrossLimitM: Float,
+        val roadDirectionDeltaDeg: Float,
         val hardCrossLimitM: Float,
         val hardCrossOk: Boolean,
+        val directionGateOk: Boolean,
+        val hardGeometryOk: Boolean,
         val warningDistanceM: Float,
         val ttcS: Float,
         val candidateLimit: Int?,
@@ -121,7 +128,11 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         var minDistanceM: Float = Float.MAX_VALUE,
         var lastGeometry: CameraGeometry? = null,
         var lastGeometryElapsed: Long = 0L,
-        var bridgeLogged: Boolean = false
+        var bridgeLogged: Boolean = false,
+        var warningStartedElapsed: Long = 0L,
+        var firstAlertDelivered: Boolean = false,
+        var lastPulseElapsed: Long = 0L,
+        var missedDuringGapLogged: Boolean = false
     )
 
     private data class AlertRequest(
@@ -153,6 +164,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private val handler = Handler(Looper.getMainLooper())
     private val speedSamples = ArrayDeque<Float>()
+    private val derivedSpeedSamples = ArrayDeque<Float>()
     private val rotationMatrix = FloatArray(9)
 
     private var rotationReady = false
@@ -161,9 +173,14 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var fusionVariance = 4f
     private var lastFusionSensorNs = 0L
     private var latestGpsFilteredKmh = Float.NaN
+    private var latestDerivedSpeedKmh = Float.NaN
     private var latestForwardAccelMps2 = 0f
     private var fusionActive = false
     private var imuBridgeActive = false
+    private var latestSpeedEstimateReliable = false
+
+    private var previousPositionForSpeed: Location? = null
+    private var previousPositionElapsedMs = 0L
 
     private var manualThresholdKmh = 80
     private var activeLimitKmh = 80
@@ -195,6 +212,14 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var liveWriter: BufferedWriter? = null
     private var lastLiveFlushElapsed = 0L
 
+    private var locationUpdatesRegistered = false
+    private var sensorsRegistered = false
+    private var gnssRegistered = false
+    private var serviceTrackingActive = false
+    private var lastGpsRequestElapsedMs = 0L
+    private var lastWatchdogReregisterElapsedMs = 0L
+    private var gpsWatchdogCount = 0
+
     @Volatile private var latestLat = Double.NaN
     @Volatile private var latestLon = Double.NaN
     @Volatile private var latestRawSpeedKmh = Float.NaN
@@ -203,24 +228,61 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     @Volatile private var latestBearingValid = false
     @Volatile private var latestAccuracy = -1f
     @Volatile private var latestProvider = "--"
-    @Volatile private var lastValidGpsElapsedMs = 0L
+
+    @Volatile private var lastGpsCallbackElapsedMs = 0L
+    @Volatile private var lastValidLocationElapsedMs = 0L
+    @Volatile private var lastValidSpeedElapsedMs = 0L
+    @Volatile private var lastSpeedEstimateElapsedMs = 0L
+    @Volatile private var lastBearingElapsedMs = 0L
     @Volatile private var gpsStale = true
+    @Volatile private var recoveredLocationGapMs = 0L
+
+    @Volatile private var gnssSatellites = 0
+    @Volatile private var gnssUsedInFix = 0
+    @Volatile private var lastGnssStatusElapsedMs = 0L
 
     @Volatile private var activeCameraId = ""
     @Volatile private var activeCameraType = ""
     @Volatile private var activeCameraDistanceM = -1f
     @Volatile private var activeCameraSpeedLimit: Int? = null
     @Volatile private var activeCameraRoadName = ""
-    @Volatile private var activeCameraRoadCrossM = -1f
+    @Volatile private var activeCameraCurveCrossM = -1f
     @Volatile private var activeCameraForwardDelta = -1f
     @Volatile private var activeCameraAlertLevel = 0
     @Volatile private var activeCameraTtcS = -1f
     @Volatile private var activeCameraWarningDistanceM = -1f
     @Volatile private var confirmedCameraCount = 0
 
-    private val staleTicker = object : Runnable {
+    private val gnssCallback = object : GnssStatus.Callback() {
+        override fun onStarted() {
+            if (loggingStarted) appendMarker("GNSS_STARTED")
+        }
+
+        override fun onStopped() {
+            gnssSatellites = 0
+            gnssUsedInFix = 0
+            if (loggingStarted) appendMarker("GNSS_STOPPED")
+        }
+
+        override fun onFirstFix(ttffMillis: Int) {
+            if (loggingStarted) appendMarker("GNSS_FIRST_FIX", "ttff_ms=$ttffMillis")
+        }
+
+        override fun onSatelliteStatusChanged(status: GnssStatus) {
+            var used = 0
+            for (i in 0 until status.satelliteCount) {
+                if (status.usedInFix(i)) used++
+            }
+            gnssSatellites = status.satelliteCount
+            gnssUsedInFix = used
+            lastGnssStatusElapsedMs = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private val healthTicker = object : Runnable {
         override fun run() {
-            updateGpsStaleState()
+            updateLocationHealth()
+            maybeRecoverGpsCallbacks()
             maybeLogSensorHealth()
             handler.postDelayed(this, 500L)
         }
@@ -263,7 +325,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         createNotificationChannel()
         acquireWakeLock()
-        handler.post(staleTicker)
+        handler.post(healthTicker)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -284,6 +346,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
             ACTION_STOP_TRIP -> {
                 userStopRequested = true
+                serviceTrackingActive = false
                 if (loggingStarted || prefs.getBoolean("trip_active", false)) {
                     ensureTripLoadedForStop()
                     appendMarker("STOP")
@@ -303,22 +366,24 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         activeLimitKmh = manualThresholdKmh
         lastAlertLimitKmh = manualThresholdKmh
         userStopRequested = false
+        serviceTrackingActive = true
 
         if (!loggingStarted && !resumeInterruptedTrip()) {
             startNewTripLog()
         }
 
-        startForeground(NOTIFICATION_ID, makeNotification("Waiting for valid GPS…"))
+        startForeground(NOTIFICATION_ID, makeNotification("Waiting for valid GPS location…"))
         prefs.edit().putBoolean("running", true).apply()
 
-        startLocationUpdates()
+        requestGpsUpdates("service_start")
+        registerGnssStatus()
         startSensorUpdates()
 
         if (loggingStarted) {
             appendMarker(
                 "CAMERA_DB_READY",
                 "raw=${cameras.size};clusters=${cameraClusters.size};" +
-                    "db=shiraz_cameras_v09;engine=clustered_confidence_v09"
+                    "db=shiraz_cameras_v10;engine=location_first_curve_aware_v10"
             )
         }
 
@@ -337,7 +402,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             while (changed) {
                 changed = false
                 val iterator = remaining.iterator()
-
                 while (iterator.hasNext()) {
                     val candidate = iterator.next()
                     if (members.any { camerasClusterCompatible(it, candidate) }) {
@@ -368,41 +432,58 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         if (a.type != b.type) return false
 
         val results = FloatArray(1)
-        Location.distanceBetween(
-            a.latitude, a.longitude,
-            b.latitude, b.longitude,
-            results
-        )
-
-        if (results[0] > CAMERA_CLUSTER_DISTANCE_M) return false
+        Location.distanceBetween(a.latitude, a.longitude, b.latitude, b.longitude, results)
+        val distance = results[0]
+        if (distance > CAMERA_CLUSTER_EXTENDED_M) return false
 
         val aRb = a.roadBearing
         val bRb = b.roadBearing
 
-        if (aRb != null && bRb != null) {
-            val aDirected = hasReliableDirectedBearing(a)
-            val bDirected = hasReliableDirectedBearing(b)
-
-            if (aDirected && bDirected) {
-                if (angleDifference(aRb, bRb) > CAMERA_CLUSTER_DIRECTED_DELTA_DEG) {
-                    return false
-                }
-            } else {
-                val axisDelta = min(
-                    angleDifference(aRb, bRb),
-                    angleDifference(aRb, normalizeBearing(bRb + 180f))
-                )
-                if (axisDelta > CAMERA_CLUSTER_AXIS_DELTA_DEG) return false
-            }
+        if (distance <= CAMERA_CLUSTER_BASE_M) {
+            if (aRb == null || bRb == null) return true
+            return bearingsClusterCompatible(a, b)
         }
+
+        // Extended clustering is deliberately strict: it exists only to collapse
+        // duplicate database records for one physical camera, not nearby distinct cameras.
+        if (aRb == null || bRb == null) return false
+        if (!bearingsClusterCompatible(a, b)) return false
+
+        val aLimit = a.speedLimit
+        val bLimit = b.speedLimit
+        if (aLimit != null && bLimit != null && abs(aLimit - bLimit) > 5) return false
+
+        val aRoad = normalizeRoadName(a.roadName)
+        val bRoad = normalizeRoadName(b.roadName)
+        if (aRoad.isNotBlank() && bRoad.isNotBlank() && aRoad != bRoad) return false
 
         return true
     }
 
+    private fun bearingsClusterCompatible(a: CameraPoint, b: CameraPoint): Boolean {
+        val aRb = a.roadBearing ?: return true
+        val bRb = b.roadBearing ?: return true
+        val aDirected = hasReliableDirectedBearing(a)
+        val bDirected = hasReliableDirectedBearing(b)
+
+        return if (aDirected && bDirected) {
+            angleDifference(aRb, bRb) <= CAMERA_CLUSTER_DIRECTED_DELTA_DEG
+        } else {
+            val axisDelta = min(
+                angleDifference(aRb, bRb),
+                angleDifference(aRb, normalizeBearing(bRb + 180f))
+            )
+            axisDelta <= CAMERA_CLUSTER_AXIS_DELTA_DEG
+        }
+    }
+
+    private fun normalizeRoadName(value: String): String =
+        value.trim().lowercase(Locale.US).replace(Regex("\\s+"), " ")
+
     private fun hasReliableDirectedBearing(camera: CameraPoint): Boolean {
         if (!camera.oneway || camera.roadBearing == null) return false
-        val c = camera.directionConfidence.lowercase(Locale.US)
-        return c == "high" || c == "medium"
+        val confidence = camera.directionConfidence.lowercase(Locale.US)
+        return confidence == "high" || confidence == "medium"
     }
 
     private fun cameraMetadataScore(camera: CameraPoint): Int {
@@ -474,14 +555,16 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     }
 
     private fun csvHeader(): String =
-        "wall_time_ms,iso_time,record_type,lat,lon,provider,gps_age_ms,gps_stale,speed_valid," +
-            "raw_speed_kmh,gps_filtered_kmh,fused_speed_kmh,forward_accel_mps2,fusion_active,imu_bridge," +
-            "bearing_deg,bearing_valid,gps_accuracy_m,camera_id,camera_type,camera_lat,camera_lon," +
-            "camera_direct_distance_m,camera_forward_m,camera_vehicle_cross_m,camera_road_cross_m," +
-            "camera_bearing_to_deg,camera_forward_delta_deg,camera_axis_delta_deg,camera_match_score," +
-            "camera_required_score,camera_confirmed,camera_alert_level,camera_ttc_s," +
-            "camera_warning_distance_m,camera_limit_kmh,active_limit_kmh,x,y,z,magnitude," +
-            "sensor_timestamp_ns,details\n"
+        "wall_time_ms,iso_time,record_type,lat,lon,provider,gps_age_ms,gps_speed_age_ms," +
+            "gps_callback_age_ms,gps_stale,location_valid,speed_valid,raw_speed_kmh,gps_filtered_kmh," +
+            "derived_speed_kmh,fused_speed_kmh,forward_accel_mps2,fusion_active,imu_bridge," +
+            "bearing_deg,bearing_valid,gps_accuracy_m,gnss_satellites,gnss_used_in_fix," +
+            "camera_id,camera_type,camera_lat,camera_lon,camera_direct_distance_m,camera_forward_m," +
+            "camera_vehicle_cross_m,camera_road_cross_m,camera_curve_cross_m,camera_bearing_to_deg," +
+            "camera_forward_delta_deg,camera_axis_delta_deg,camera_direction_delta_deg," +
+            "camera_hard_geometry_ok,camera_match_score,camera_required_score,camera_confirmed," +
+            "camera_alert_level,camera_ttc_s,camera_warning_distance_m,camera_limit_kmh,active_limit_kmh," +
+            "x,y,z,magnitude,sensor_timestamp_ns,details\n"
 
     private fun startNewTripLog() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -491,7 +574,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         liveLogUri = createPublicLiveLog(logName)
         openLiveWriter()
-
         try {
             liveWriter?.write(csvHeader())
             liveWriter?.flush()
@@ -504,19 +586,28 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             .apply()
 
         loggingStarted = true
-
         appendMarker(
             "START",
-            "persistent_live_log=true;camera_engine=clustered_confidence_v09;raw_sensor_csv=false"
+            "persistent_live_log=true;camera_engine=location_first_curve_aware_v10;raw_sensor_csv=false"
         )
     }
 
     private fun resumeInterruptedTrip(): Boolean {
         if (!prefs.getBoolean("trip_active", false)) return false
-
         val name = prefs.getString("active_log_name", null) ?: return false
         val internal = File(filesDir, name)
         if (!internal.exists() || internal.length() == 0L) return false
+
+        val header = try { internal.bufferedReader().use { it.readLine() ?: "" } } catch (_: Exception) { "" }
+        if (!header.contains("gps_speed_age_ms") || !header.contains("camera_curve_cross_m")) {
+            prefs.edit()
+                .putBoolean("trip_active", false)
+                .putString("last_log_name", name)
+                .remove("active_log_uri")
+                .remove("active_log_name")
+                .apply()
+            return false
+        }
 
         logName = name
         logFile = internal
@@ -558,15 +649,11 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private fun createPublicLiveLog(name: String): Uri? {
         if (Build.VERSION.SDK_INT < 29) return null
-
         return try {
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, name)
                 put(MediaStore.Downloads.MIME_TYPE, "text/csv")
-                put(
-                    MediaStore.Downloads.RELATIVE_PATH,
-                    Environment.DIRECTORY_DOWNLOADS + "/MOJODrive"
-                )
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/MOJODrive")
             }
             contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
         } catch (_: Exception) {
@@ -577,11 +664,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private fun openLiveWriter() {
         closeLiveWriter()
         val uri = liveLogUri ?: return
-
         try {
-            liveWriter = BufferedWriter(
-                OutputStreamWriter(contentResolver.openOutputStream(uri, "wa")!!)
-            )
+            liveWriter = BufferedWriter(OutputStreamWriter(contentResolver.openOutputStream(uri, "wa")!!))
             lastLiveFlushElapsed = SystemClock.elapsedRealtime()
         } catch (_: Exception) {
             liveWriter = null
@@ -601,7 +685,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         }
 
         closeLiveWriter()
-
         prefs.edit()
             .putBoolean("trip_active", false)
             .putBoolean("running", false)
@@ -611,7 +694,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             .apply()
 
         loggingStarted = false
-
         Toast.makeText(
             this,
             "Trip log finalized: Downloads/MOJODrive/$logName",
@@ -619,15 +701,20 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         ).show()
     }
 
-
-    private fun startLocationUpdates() {
+    private fun requestGpsUpdates(reason: String) {
         if (
             checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
             checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED
         ) {
-            stopSelf()
             return
         }
+
+        try {
+            if (locationUpdatesRegistered) {
+                locationManager.removeUpdates(this)
+                locationUpdatesRegistered = false
+            }
+        } catch (_: Exception) {}
 
         try {
             if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
@@ -637,30 +724,121 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                     0f,
                     this
                 )
+                locationUpdatesRegistered = true
+                lastGpsRequestElapsedMs = SystemClock.elapsedRealtime()
+                if (loggingStarted) appendMarker("GPS_REQUEST", "reason=$reason")
+            } else if (loggingStarted) {
+                appendMarker("GPS_PROVIDER_DISABLED", "reason=$reason")
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            if (loggingStarted) appendMarker("GPS_REQUEST_FAILED", "reason=$reason;error=${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun registerGnssStatus() {
+        if (gnssRegistered) return
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
+        try {
+            gnssRegistered = locationManager.registerGnssStatusCallback(gnssCallback, handler)
+        } catch (_: Exception) {
+            gnssRegistered = false
+        }
     }
 
     private fun startSensorUpdates() {
+        if (sensorsRegistered) return
         accelerometer?.let { sensorManager.registerListener(this, it, 20_000) }
         gyroscope?.let { sensorManager.registerListener(this, it, 20_000) }
         linearAcceleration?.let { sensorManager.registerListener(this, it, 20_000) }
-        rotationVector?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        sensorsRegistered = true
+    }
+
+    private fun maybeRecoverGpsCallbacks() {
+        if (!serviceTrackingActive || !locationUpdatesRegistered) return
+        val now = SystemClock.elapsedRealtime()
+        val callbackAge = currentGpsCallbackAgeMs()
+        val sinceRequest = now - lastGpsRequestElapsedMs
+        val stalled =
+            if (lastGpsCallbackElapsedMs <= 0L) {
+                sinceRequest >= GPS_CALLBACK_WATCHDOG_MS
+            } else {
+                callbackAge >= GPS_CALLBACK_WATCHDOG_MS
+            }
+
+        if (
+            stalled &&
+            now - lastWatchdogReregisterElapsedMs >= GPS_WATCHDOG_COOLDOWN_MS
+        ) {
+            lastWatchdogReregisterElapsedMs = now
+            gpsWatchdogCount++
+            appendMarker(
+                "GPS_WATCHDOG_REREGISTER",
+                "callbackAgeMs=$callbackAge;sinceRequestMs=$sinceRequest;count=$gpsWatchdogCount;" +
+                    "satellites=$gnssSatellites;used=$gnssUsedInFix"
+            )
+            requestGpsUpdates("watchdog")
+            registerGnssStatus()
         }
     }
 
     override fun onLocationChanged(location: Location) {
         if (location.provider != LocationManager.GPS_PROVIDER) return
 
-        latestLat = location.latitude
-        latestLon = location.longitude
-        latestProvider = location.provider ?: "gps"
-        latestAccuracy = if (location.hasAccuracy()) location.accuracy else -1f
+        val now = SystemClock.elapsedRealtime()
+        val previousCallback = lastGpsCallbackElapsedMs
+        lastGpsCallbackElapsedMs = now
 
         val ageMs = locationAgeMs(location)
+        val accuracy = if (location.hasAccuracy()) location.accuracy else -1f
         val rawSpeed = if (location.hasSpeed()) location.speed * 3.6f else Float.NaN
+        val rawLat = location.latitude
+        val rawLon = location.longitude
+
+        val locationValid =
+            ageMs in 0L..3000L &&
+                (!location.hasAccuracy() || location.accuracy <= 50f) &&
+                rawLat.isFinite() &&
+                rawLon.isFinite() &&
+                rawLat in -90.0..90.0 &&
+                rawLon in -180.0..180.0
+
+        if (!locationValid) {
+            appendRow(
+                "GPS_LOCATION_REJECTED",
+                Float.NaN, Float.NaN, Float.NaN, Float.NaN,
+                0L,
+                false,
+                false,
+                "reason=${locationRejectionReason(location, ageMs)};" +
+                    "rawLat=${String.format(Locale.US, "%.7f", rawLat)};" +
+                    "rawLon=${String.format(Locale.US, "%.7f", rawLon)};" +
+                    "rawAcc=${String.format(Locale.US, "%.1f", accuracy)};" +
+                    "callbackGapMs=${if (previousCallback > 0L) now - previousCallback else -1L}",
+                null
+            )
+            updatePrefs()
+            updateNotification()
+            return
+        }
+
+        val locationGap =
+            if (lastValidLocationElapsedMs > 0L) now - lastValidLocationElapsedMs else 0L
+        recoveredLocationGapMs = locationGap
+
+        if (locationGap >= LOCATION_RECOVERY_RESET_MS) {
+            prepareForLocationGapRecovery(locationGap)
+        }
+
+        latestLat = rawLat
+        latestLon = rawLon
+        latestProvider = location.provider ?: "gps"
+        latestAccuracy = accuracy
         latestRawSpeedKmh = rawSpeed
+        lastValidLocationElapsedMs = now
+        gpsStale = false
+
+        latestDerivedSpeedKmh = updateDerivedSpeed(location, now)
 
         val speedAccuracyOk =
             if (Build.VERSION.SDK_INT >= 26 && location.hasSpeedAccuracy()) {
@@ -669,22 +847,35 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 true
             }
 
-        val accepted =
+        val speedValid =
             location.hasSpeed() &&
-                ageMs in 0..3000 &&
-                (!location.hasAccuracy() || location.accuracy <= 50f) &&
                 speedAccuracyOk &&
                 rawSpeed in 0f..250f
 
-        if (accepted) {
+        val bearingSupportSpeed = when {
+            speedValid -> rawSpeed
+            latestDerivedSpeedKmh.isFinite() -> latestDerivedSpeedKmh
+            else -> latestSpeedKmh
+        }
+
+        if (location.hasBearing() && bearingSupportSpeed >= 5f) {
+            latestBearing = normalizeBearing(location.bearing)
+            latestBearingValid = true
+            lastBearingElapsedMs = now
+        } else {
+            latestBearingValid =
+                lastBearingElapsedMs > 0L &&
+                    now - lastBearingElapsedMs <= BEARING_HOLD_MS
+        }
+
+        val priorGpsSpeedAge = currentGpsSpeedAgeMs()
+
+        if (speedValid) {
+            if (priorGpsSpeedAge < 0L || priorGpsSpeedAge > 5000L) {
+                speedSamples.clear()
+            }
+
             latestGpsFilteredKmh = filteredSpeed(rawSpeed)
-            lastValidGpsElapsedMs = SystemClock.elapsedRealtime()
-            gpsStale = false
-            imuBridgeActive = false
-
-            latestBearingValid = location.hasBearing() && latestGpsFilteredKmh >= 8f
-            if (latestBearingValid) latestBearing = location.bearing
-
             val gpsSpeedAccuracyMps =
                 if (Build.VERSION.SDK_INT >= 26 && location.hasSpeedAccuracy()) {
                     location.speedAccuracyMetersPerSecond.coerceIn(0.3f, 5.5f)
@@ -692,50 +883,84 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                     2.0f
                 }
 
-            correctFusionWithGps(
-                latestGpsFilteredKmh / 3.6f,
-                gpsSpeedAccuracyMps
-            )
+            if (!fusionInitialized || priorGpsSpeedAge < 0L || priorGpsSpeedAge > 10_000L) {
+                resetFusionWithMeasurement(latestGpsFilteredKmh / 3.6f, gpsSpeedAccuracyMps)
+            } else {
+                correctFusionWithMeasurement(latestGpsFilteredKmh / 3.6f, gpsSpeedAccuracyMps)
+            }
 
-            latestSpeedKmh = (fusionSpeedMps * 3.6f).coerceIn(0f, 250f)
-
-            evaluateAllCameras()
-            handleOverspeed(latestSpeedKmh)
-
-            appendRow(
-                "GPS",
-                Float.NaN, Float.NaN, Float.NaN, Float.NaN,
-                0L,
-                true,
-                "fusion=${if (fusionActive) "GPS_IMU" else "GPS"}",
-                null
-            )
+            lastValidSpeedElapsedMs = now
+            lastSpeedEstimateElapsedMs = now
+            latestSpeedEstimateReliable = true
+        } else if (
+            latestDerivedSpeedKmh.isFinite() &&
+            latestDerivedSpeedKmh in 0f..250f &&
+            latestAccuracy in 0f..25f
+        ) {
+            // Keep Camera Engine alive when Android reports poor speed accuracy.
+            // Position-derived speed is deliberately a weak correction, not a replacement
+            // for a good GNSS speed measurement.
+            val derivedMps = latestDerivedSpeedKmh / 3.6f
+            if (!fusionInitialized) {
+                resetFusionWithMeasurement(derivedMps, 4.5f)
+            } else {
+                correctFusionWithMeasurement(derivedMps, 4.5f)
+            }
+            lastSpeedEstimateElapsedMs = now
+            latestSpeedEstimateReliable = latestAccuracy <= 15f
         } else {
-            appendRow(
-                "GPS_REJECTED",
-                Float.NaN, Float.NaN, Float.NaN, Float.NaN,
-                0L,
-                false,
-                rejectionReason(location, ageMs, speedAccuracyOk),
-                null
-            )
+            latestSpeedEstimateReliable = currentSpeedEstimateAgeMs() in 0L..3000L
         }
 
+        if (fusionInitialized) {
+            latestSpeedKmh = (fusionSpeedMps * 3.6f).coerceIn(0f, 250f)
+        } else if (latestDerivedSpeedKmh.isFinite()) {
+            latestSpeedKmh = latestDerivedSpeedKmh.coerceIn(0f, 250f)
+        } else if (speedValid) {
+            latestSpeedKmh = rawSpeed.coerceIn(0f, 250f)
+        }
+
+        imuBridgeActive = !speedValid && currentSpeedEstimateAgeMs() in 0L..FUSION_BRIDGE_MS
+
+        evaluateAllCameras()
+        if (latestSpeedEstimateReliable) handleOverspeed(latestSpeedKmh)
+
+        val speedReason = if (speedValid) "OK" else speedRejectionReason(location, speedAccuracyOk)
+        appendRow(
+            if (speedValid) "GPS" else "GPS_LOCATION_ONLY",
+            Float.NaN, Float.NaN, Float.NaN, Float.NaN,
+            0L,
+            true,
+            speedValid,
+            "speedReason=$speedReason;" +
+                "derived=${if (latestDerivedSpeedKmh.isFinite()) String.format(Locale.US, "%.2f", latestDerivedSpeedKmh) else ""};" +
+                "locationGapMs=$locationGap;" +
+                "callbackGapMs=${if (previousCallback > 0L) now - previousCallback else -1L};" +
+                "fusion=${if (fusionActive) "GPS_IMU" else "GPS_OR_POSITION"}",
+            null
+        )
+
+        recoveredLocationGapMs = 0L
         updatePrefs()
         updateNotification()
     }
 
-    private fun rejectionReason(
-        location: Location,
-        ageMs: Long,
-        speedAccuracyOk: Boolean
-    ): String {
+    private fun locationRejectionReason(location: Location, ageMs: Long): String {
+        return when {
+            ageMs !in 0L..3000L -> "STALE_LOCATION"
+            location.hasAccuracy() && location.accuracy > 50f -> "POOR_LOCATION_ACCURACY"
+            !location.latitude.isFinite() || !location.longitude.isFinite() -> "NONFINITE_LOCATION"
+            else -> "INVALID_LOCATION"
+        }
+    }
+
+    private fun speedRejectionReason(location: Location, speedAccuracyOk: Boolean): String {
+        val rawSpeed = if (location.hasSpeed()) location.speed * 3.6f else Float.NaN
         return when {
             !location.hasSpeed() -> "NO_SPEED"
-            ageMs !in 0..3000 -> "STALE_FIX"
-            location.hasAccuracy() && location.accuracy > 50f -> "POOR_ACCURACY"
             !speedAccuracyOk -> "POOR_SPEED_ACCURACY"
-            else -> "INVALID_SPEED"
+            rawSpeed !in 0f..250f -> "INVALID_SPEED"
+            else -> "UNKNOWN_SPEED_REJECT"
         }
     }
 
@@ -754,32 +979,79 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         return speedSamples.sorted()[speedSamples.size / 2]
     }
 
-    private fun correctFusionWithGps(
-        gpsSpeedMps: Float,
-        speedAccuracyMps: Float
-    ) {
+    private fun updateDerivedSpeed(location: Location, now: Long): Float {
+        val previous = previousPositionForSpeed
+        val previousTime = previousPositionElapsedMs
+
+        previousPositionForSpeed = Location(location)
+        previousPositionElapsedMs = now
+
+        if (previous == null || previousTime <= 0L) return Float.NaN
+        val dt = (now - previousTime) / 1000f
+        if (dt !in 0.4f..3.5f) {
+            derivedSpeedSamples.clear()
+            return Float.NaN
+        }
+
+        val prevAcc = if (previous.hasAccuracy()) previous.accuracy else 25f
+        val curAcc = if (location.hasAccuracy()) location.accuracy else 25f
+        if (prevAcc > 25f || curAcc > 25f) return Float.NaN
+
+        val kmh = previous.distanceTo(location) / dt * 3.6f
+        if (kmh !in 0f..250f) return Float.NaN
+
+        derivedSpeedSamples.addLast(kmh)
+        while (derivedSpeedSamples.size > 3) derivedSpeedSamples.removeFirst()
+        return derivedSpeedSamples.sorted()[derivedSpeedSamples.size / 2]
+    }
+
+    private fun resetFusionWithMeasurement(speedMps: Float, accuracyMps: Float) {
+        fusionSpeedMps = speedMps.coerceIn(0f, 70f)
+        fusionVariance = max(1f, accuracyMps * accuracyMps)
+        fusionInitialized = true
+        fusionActive = linearAcceleration != null && rotationVector != null
+        lastFusionSensorNs = 0L
+    }
+
+    private fun correctFusionWithMeasurement(speedMps: Float, accuracyMps: Float) {
         if (!fusionInitialized) {
-            fusionSpeedMps = gpsSpeedMps.coerceAtLeast(0f)
-            fusionVariance = max(1f, speedAccuracyMps * speedAccuracyMps)
-            fusionInitialized = true
-            fusionActive = linearAcceleration != null && rotationVector != null
-            lastFusionSensorNs = 0L
+            resetFusionWithMeasurement(speedMps, accuracyMps)
             return
         }
 
-        val measurementVariance = max(0.25f, speedAccuracyMps * speedAccuracyMps)
+        val measurementVariance = max(0.25f, accuracyMps * accuracyMps)
         val gain = fusionVariance / (fusionVariance + measurementVariance)
-
-        fusionSpeedMps += gain * (gpsSpeedMps - fusionSpeedMps)
+        fusionSpeedMps += gain * (speedMps - fusionSpeedMps)
         fusionSpeedMps = fusionSpeedMps.coerceIn(0f, 70f)
         fusionVariance = max(0.05f, (1f - gain) * fusionVariance)
         fusionActive = linearAcceleration != null && rotationVector != null
     }
 
-    private fun predictFusion(
-        forwardAccelMps2: Float,
-        sensorTimestampNs: Long
-    ) {
+    private fun prepareForLocationGapRecovery(gapMs: Long) {
+        speedSamples.clear()
+        derivedSpeedSamples.clear()
+        previousPositionForSpeed = null
+        previousPositionElapsedMs = 0L
+
+        for ((_, state) in cameraStates) {
+            state.lastDistanceM = Float.MAX_VALUE
+            state.awayHits = 0
+            state.hardBadHits = 0
+            if (state.phase == TrackPhase.TRACKING) {
+                state.confirmHits = 0
+                state.approachHits = 0
+            }
+        }
+
+        if (loggingStarted) {
+            appendMarker(
+                "GPS_LOCATION_RECOVERED",
+                "gapMs=$gapMs;satellites=$gnssSatellites;used=$gnssUsedInFix"
+            )
+        }
+    }
+
+    private fun predictFusion(forwardAccelMps2: Float, sensorTimestampNs: Long) {
         if (!fusionInitialized || !latestBearingValid || !rotationReady) {
             lastFusionSensorNs = sensorTimestampNs
             return
@@ -793,29 +1065,24 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val dt =
             ((sensorTimestampNs - lastFusionSensorNs) / 1_000_000_000.0f)
                 .coerceIn(0f, 0.20f)
-
         lastFusionSensorNs = sensorTimestampNs
         if (dt <= 0f) return
 
-        val age = currentGpsAgeMs()
-        if (age < 0L || age > FUSION_BRIDGE_MS) return
+        val estimateAge = currentSpeedEstimateAgeMs()
+        if (estimateAge < 0L || estimateAge > FUSION_BRIDGE_MS) return
 
         val a =
-            if (abs(forwardAccelMps2) < 0.08f) {
-                0f
-            } else {
-                forwardAccelMps2.coerceIn(-8f, 8f)
-            }
+            if (abs(forwardAccelMps2) < 0.08f) 0f
+            else forwardAccelMps2.coerceIn(-8f, 8f)
 
         fusionSpeedMps = (fusionSpeedMps + a * dt).coerceIn(0f, 70f)
         fusionVariance = (fusionVariance + (0.7f * 0.7f * dt)).coerceAtMost(25f)
-
         latestForwardAccelMps2 = a
         latestSpeedKmh = (fusionSpeedMps * 3.6f).coerceIn(0f, 250f)
-        imuBridgeActive = age > 1200L && latestSpeedKmh >= 5f
+        imuBridgeActive = currentGpsSpeedAgeMs() > 1200L && estimateAge <= FUSION_BRIDGE_MS
         fusionActive = true
 
-        if (!gpsStale) handleOverspeed(latestSpeedKmh)
+        if (!gpsStale && latestSpeedEstimateReliable) handleOverspeed(latestSpeedKmh)
         updatePrefs()
     }
 
@@ -838,35 +1105,63 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         val br = Math.toRadians(latestBearing.toDouble())
         val forward = (east * sin(br) + north * cos(br)).toFloat()
-
         predictFusion(forward, event.timestamp)
     }
 
-    private fun updateGpsStaleState() {
-        val age = currentGpsAgeMs()
-        val staleNow = age < 0L || age > GPS_STALE_MS
+    private fun updateLocationHealth() {
+        val locationAge = currentGpsAgeMs()
+        val staleNow = locationAge < 0L || locationAge > LOCATION_STALE_MS
 
         if (staleNow != gpsStale) {
             gpsStale = staleNow
-            if (gpsStale && loggingStarted) appendMarker("GPS_STALE")
+            if (gpsStale && loggingStarted) {
+                appendMarker(
+                    "GPS_STALE",
+                    "locationAgeMs=$locationAge;callbackAgeMs=${currentGpsCallbackAgeMs()};" +
+                        "speedAgeMs=${currentGpsSpeedAgeMs()};satellites=$gnssSatellites;used=$gnssUsedInFix"
+                )
+            }
         }
 
+        val estimateAge = currentSpeedEstimateAgeMs()
         imuBridgeActive =
             fusionActive &&
-                !gpsStale &&
-                age > 1200L &&
+                estimateAge in 1201..FUSION_BRIDGE_MS &&
                 latestSpeedKmh >= 5f
 
-        if (age in GPS_CAMERA_BRIDGE_START_MS..GPS_CAMERA_BRIDGE_MAX_MS) {
-            bridgeConfirmedCameraAlerts(age)
+        if (locationAge in GPS_CAMERA_BRIDGE_START_MS..GPS_CAMERA_BRIDGE_MAX_MS) {
+            bridgeConfirmedCameraAlerts(locationAge)
+        }
+
+        if (
+            latestBearingValid &&
+            lastBearingElapsedMs > 0L &&
+            SystemClock.elapsedRealtime() - lastBearingElapsedMs > BEARING_HOLD_MS
+        ) {
+            latestBearingValid = false
         }
 
         updatePrefs()
     }
 
     private fun currentGpsAgeMs(): Long {
-        if (lastValidGpsElapsedMs <= 0L) return -1L
-        return (SystemClock.elapsedRealtime() - lastValidGpsElapsedMs).coerceAtLeast(0L)
+        if (lastValidLocationElapsedMs <= 0L) return -1L
+        return (SystemClock.elapsedRealtime() - lastValidLocationElapsedMs).coerceAtLeast(0L)
+    }
+
+    private fun currentGpsSpeedAgeMs(): Long {
+        if (lastValidSpeedElapsedMs <= 0L) return -1L
+        return (SystemClock.elapsedRealtime() - lastValidSpeedElapsedMs).coerceAtLeast(0L)
+    }
+
+    private fun currentSpeedEstimateAgeMs(): Long {
+        if (lastSpeedEstimateElapsedMs <= 0L) return -1L
+        return (SystemClock.elapsedRealtime() - lastSpeedEstimateElapsedMs).coerceAtLeast(0L)
+    }
+
+    private fun currentGpsCallbackAgeMs(): Long {
+        if (lastGpsCallbackElapsedMs <= 0L) return -1L
+        return (SystemClock.elapsedRealtime() - lastGpsCallbackElapsedMs).coerceAtLeast(0L)
     }
 
     private fun evaluateAllCameras() {
@@ -878,12 +1173,11 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             cameraClusters.isEmpty() ||
             !latestBearingValid
         ) {
-            clearUiCamera()
+            if (confirmedCameraCount == 0) clearUiCamera()
             return
         }
 
         val now = SystemClock.elapsedRealtime()
-
         val from = Location("current").apply {
             latitude = latestLat
             longitude = latestLon
@@ -894,7 +1188,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         for (cluster in cameraClusters) {
             val camera = cluster.camera
-
             val to = Location("camera").apply {
                 latitude = camera.latitude
                 longitude = camera.longitude
@@ -914,58 +1207,47 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 cameraStates[cluster.key] = state
             }
 
-            if (
-                state.phase == TrackPhase.PASSED ||
-                state.phase == TrackPhase.ABANDONED
-            ) {
+            if (state.phase == TrackPhase.PASSED || state.phase == TrackPhase.ABANDONED) {
                 state.lastSeenElapsed = now
                 continue
             }
 
             val geometry = buildCameraGeometry(from, to, cluster, state, now)
-
             state.lastSeenElapsed = now
             state.minDistanceM = min(state.minDistanceM, geometry.directDistanceM)
-
             updateApproachState(state, geometry)
 
             val withinConfirmRange =
                 geometry.directDistanceM <=
-                    max(
-                        900f,
-                        geometry.warningDistanceM + CAMERA_CONFIRM_EXTRA_M
-                    )
+                    max(950f, geometry.warningDistanceM + CAMERA_CONFIRM_EXTRA_M)
 
             val strongApproachHistory = state.approachHits >= 2
-
             val nearFastTrack =
-                geometry.directDistanceM <= 450f &&
+                geometry.directDistanceM <= 500f &&
                     strongApproachHistory &&
-                    geometry.hardCrossOk &&
-                    geometry.forwardDeltaDeg <= 78f &&
+                    geometry.hardGeometryOk &&
                     geometry.matchScore >= geometry.requiredScore - 1
 
             val confirmEligible =
                 withinConfirmRange &&
-                    geometry.hardCrossOk &&
-                    geometry.vehicleForwardM > 8f &&
+                    geometry.hardGeometryOk &&
                     (
                         geometry.matchScore >= geometry.requiredScore ||
-                        nearFastTrack
+                            nearFastTrack
+                    ) &&
+                    (
+                        state.approachHits >= 1 ||
+                            geometry.directDistanceM <= 250f
                     )
 
             if (state.phase == TrackPhase.TRACKING) {
                 if (confirmEligible) {
                     state.confirmHits++
-
-                    val hitsNeeded =
-                        if (nearFastTrack) 1 else geometry.requiredHits
-
+                    val hitsNeeded = if (nearFastTrack) 1 else geometry.requiredHits
                     if (state.confirmHits >= hitsNeeded) {
                         state.phase = TrackPhase.CONFIRMED
                         state.transitionElapsed = now
                         state.hardBadHits = 0
-
                         appendCameraEvent(
                             "CAMERA_MATCH_CONFIRMED",
                             geometry,
@@ -985,7 +1267,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 now - state.lastDiagElapsed >= CAMERA_DIAG_INTERVAL_MS
             ) {
                 state.lastDiagElapsed = now
-
                 appendCameraEvent(
                     "CAMERA_MATCH_DIAG",
                     geometry,
@@ -1000,7 +1281,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 !state.nearPassAudited
             ) {
                 state.nearPassAudited = true
-
                 appendCameraEvent(
                     "CAMERA_NEAR_PASS_AUDIT",
                     geometry,
@@ -1014,19 +1294,32 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 state.lastGeometry = geometry
                 state.lastGeometryElapsed = now
 
-                if (geometry.hardCrossOk) {
-                    state.hardBadHits = 0
-                } else {
-                    state.hardBadHits++
+                if (geometry.hardGeometryOk) state.hardBadHits = 0 else state.hardBadHits++
+
+                // If a long location gap ended after the camera had already moved behind us,
+                // never emit a late beep. Record the miss explicitly instead.
+                if (
+                    recoveredLocationGapMs > LOCATION_STALE_MS &&
+                    geometry.vehicleForwardM <= 0f
+                ) {
+                    if (!state.warned && !state.missedDuringGapLogged) {
+                        state.missedDuringGapLogged = true
+                        appendCameraEvent(
+                            "CAMERA_MISSED_DURING_GPS_GAP",
+                            geometry,
+                            state,
+                            "gapMs=$recoveredLocationGapMs;minDistance=${String.format(Locale.US, "%.1f", state.minDistanceM)}"
+                        )
+                    }
+                    markCameraPassed(geometry, state, now)
+                    state.lastDistanceM = geometry.directDistanceM
+                    continue
                 }
 
-                val clearlyBehind =
-                    geometry.forwardDeltaDeg >= PASS_BEHIND_DEG
-
+                val clearlyBehind = geometry.forwardDeltaDeg >= PASS_BEHIND_DEG
                 val distanceGrowing =
                     state.lastDistanceM != Float.MAX_VALUE &&
-                        geometry.directDistanceM >
-                            state.minDistanceM + PASS_DISTANCE_GROWTH_M
+                        geometry.directDistanceM > state.minDistanceM + PASS_DISTANCE_GROWTH_M
 
                 if (clearlyBehind && distanceGrowing) {
                     state.awayHits++
@@ -1045,40 +1338,31 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                     state.phase = TrackPhase.ABANDONED
                     state.transitionElapsed = now
                     state.alertLevel = 0
-
                     appendCameraEvent(
                         "CAMERA_ABANDONED",
                         geometry,
                         state,
-                        "reason=hard_cross_failed_while_moving_away;hardBadHits=${state.hardBadHits}"
+                        "reason=hard_geometry_failed_while_moving_away;hardBadHits=${state.hardBadHits}"
                     )
-
                     state.lastDistanceM = geometry.directDistanceM
                     continue
                 }
 
-                confirmedGeometries += geometry
-
-                computeAlertRequest(
-                    geometry,
-                    state,
-                    false
-                )?.let {
-                    alertRequests += it
+                if (geometry.vehicleForwardM > 0f && geometry.forwardDeltaDeg < PASS_BEHIND_DEG) {
+                    confirmedGeometries += geometry
                 }
+
+                computeAlertRequest(geometry, state, false)?.let { alertRequests += it }
             }
 
             state.lastDistanceM = geometry.directDistanceM
         }
 
-        confirmedCameraCount =
-            confirmedGeometries.count { it.vehicleForwardM > 0f }
-
+        confirmedCameraCount = confirmedGeometries.count { it.vehicleForwardM > 0f }
         chooseUiCamera(confirmedGeometries)
 
         cameraAlertZoneActive = alertRequests.isNotEmpty()
-        dispatchBestCameraAlert(alertRequests)
-
+        dispatchCameraAlerts(alertRequests)
         cleanupOldCameraStates(now)
     }
 
@@ -1115,46 +1399,17 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         state: CameraTrackState,
         now: Long
     ): CameraGeometry {
-
         val camera = cluster.camera
         val distance = from.distanceTo(to)
-
-        val bearingToCamera =
-            normalizeBearing(from.bearingTo(to))
-
-        val forwardDelta =
-            angleDifference(latestBearing, bearingToCamera)
+        val bearingToCamera = normalizeBearing(from.bearingTo(to))
+        val forwardDelta = angleDifference(latestBearing, bearingToCamera)
 
         val vehicleForward =
-            (
-                distance *
-                    cos(Math.toRadians(forwardDelta.toDouble()))
-                ).toFloat()
-
+            (distance * cos(Math.toRadians(forwardDelta.toDouble()))).toFloat()
         val vehicleCross =
-            abs(
-                distance *
-                    sin(Math.toRadians(forwardDelta.toDouble()))
-            ).toFloat()
+            abs(distance * sin(Math.toRadians(forwardDelta.toDouble()))).toFloat()
 
         val rb = camera.roadBearing
-
-        val roadCross =
-            if (rb != null) {
-                val axisToCamera =
-                    min(
-                        angleDifference(normalizeBearing(rb), bearingToCamera),
-                        angleDifference(normalizeBearing(rb + 180f), bearingToCamera)
-                    )
-
-                abs(
-                    distance *
-                        sin(Math.toRadians(axisToCamera.toDouble()))
-                ).toFloat()
-            } else {
-                vehicleCross
-            }
-
         val roadAxisDelta =
             if (rb != null) {
                 min(
@@ -1165,44 +1420,90 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 0f
             }
 
-        val softCrossLimit =
-            (
-                CAMERA_SOFT_CROSS_BASE_M +
-                    max(0f, latestAccuracy) * 1.4f
-                ).coerceIn(
-                    CAMERA_SOFT_CROSS_BASE_M,
-                    CAMERA_SOFT_CROSS_MAX_M
-                )
-
-        val curveAllowance =
-            when {
-                distance <= 250f -> 0f
-                distance <= 600f -> (distance - 250f) * 0.10f
-                distance <= 1000f -> 35f + (distance - 600f) * 0.10f
-                else -> 75f + (distance - 1000f) * 0.05f
+        val roadDirectionDelta =
+            if (rb != null) {
+                if (hasReliableDirectedBearing(camera)) {
+                    angleDifference(latestBearing, normalizeBearing(rb))
+                } else {
+                    roadAxisDelta
+                }
+            } else {
+                0f
             }
 
-        val hardCrossLimit =
-            (softCrossLimit + curveAllowance)
-                .coerceIn(65f, 190f)
+        val roadCross =
+            if (rb != null) {
+                val cameraAxisDelta = min(
+                    angleDifference(normalizeBearing(rb), bearingToCamera),
+                    angleDifference(normalizeBearing(rb + 180f), bearingToCamera)
+                )
+                abs(
+                    distance * sin(Math.toRadians(cameraAxisDelta.toDouble()))
+                ).toFloat()
+            } else {
+                vehicleCross
+            }
 
-        val hardCrossOk =
-            roadCross <= hardCrossLimit
+        // Curve-aware cross-track: a curved road can make the camera-road tangent and
+        // the car's instantaneous heading disagree strongly at long range. We hard-reject
+        // only when BOTH independent cross-track views are bad. Score can never override it.
+        val curveCross = if (rb != null) min(vehicleCross, roadCross) else vehicleCross
 
-        val candidateLimit =
-            if (camera.type == "speed") validDynamicLimit(camera) else null
+        val baseHardCrossLimit =
+            when {
+                distance > 1500f -> 230f
+                distance > 1100f -> 210f
+                distance > 800f -> 195f
+                distance > 600f -> 178f
+                distance > 450f -> 145f
+                distance > 300f -> 115f
+                else -> 80f
+            }
 
-        val warningDistance =
-            computeAdaptiveWarningDistanceM(
-                latestSpeedKmh,
-                candidateLimit,
-                camera.type
-            )
+        val accuracyAllowance =
+            if (latestAccuracy >= 0f) (latestAccuracy * 1.2f).coerceIn(0f, 20f) else 10f
+        val hardCrossLimit = baseHardCrossLimit + accuracyAllowance
+        val hardCrossOk = curveCross <= hardCrossLimit
+
+        val forwardLimit =
+            when {
+                distance > 1100f -> 45f
+                distance > 750f -> 50f
+                distance > 550f -> 55f
+                distance > 350f -> 68f
+                else -> 85f
+            }
+
+        val roadDirectionLimit =
+            when {
+                distance > 1100f -> 42f
+                distance > 750f -> 48f
+                distance > 550f -> 55f
+                distance > 350f -> 65f
+                else -> 78f
+            }
+
+        val directionGateOk =
+            forwardDelta <= forwardLimit &&
+                (
+                    rb == null ||
+                        roadDirectionDelta <= roadDirectionLimit
+                    )
+
+        val hardGeometryOk =
+            vehicleForward > 8f &&
+                hardCrossOk &&
+                directionGateOk
+
+        val candidateLimit = if (camera.type == "speed") validDynamicLimit(camera) else null
+        val warningDistance = computeAdaptiveWarningDistanceM(
+            latestSpeedKmh,
+            candidateLimit,
+            camera.type
+        )
 
         val speedMps = max(1.5f, latestSpeedKmh / 3.6f)
-
-        val ttc =
-            if (vehicleForward > 0f) vehicleForward / speedMps else -1f
+        val ttc = if (vehicleForward > 0f) vehicleForward / speedMps else -1f
 
         val dtS =
             if (state.lastSeenElapsed > 0L) {
@@ -1212,56 +1513,40 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             }
 
         val approachDelta =
-            if (state.lastDistanceM != Float.MAX_VALUE) {
-                state.lastDistanceM - distance
-            } else {
-                0f
-            }
-
-        val approachRate =
-            if (dtS > 0f) approachDelta / dtS else 0f
+            if (state.lastDistanceM != Float.MAX_VALUE) state.lastDistanceM - distance else 0f
+        val approachRate = if (dtS > 0f) approachDelta / dtS else 0f
 
         var score = 0
         val reasons = ArrayList<String>()
 
         if (!hardCrossOk) {
-            reasons += "hard_cross"
+            reasons += "hard_curve_cross"
         } else {
             when {
-                roadCross <= softCrossLimit * 0.65f -> score += 3
-                roadCross <= softCrossLimit -> score += 2
+                curveCross <= hardCrossLimit * 0.35f -> score += 3
+                curveCross <= hardCrossLimit * 0.65f -> score += 2
                 else -> score += 1
             }
         }
 
+        when {
+            forwardDelta <= 20f -> score += 3
+            forwardDelta <= 35f -> score += 2
+            forwardDelta <= 55f -> score += 1
+            else -> reasons += if (forwardDelta >= PASS_BEHIND_DEG) "behind_vehicle" else "forward_angle"
+        }
+
         if (rb != null) {
             when {
-                roadAxisDelta <= 22f -> score += 2
-                roadAxisDelta <= 48f -> score += 1
-                else -> reasons += "road_axis"
+                roadDirectionDelta <= 20f -> score += 2
+                roadDirectionDelta <= 40f -> score += 1
+                else -> reasons += if (hasReliableDirectedBearing(camera)) "road_direction" else "road_axis"
             }
         } else {
             score += 1
         }
 
-        when {
-            forwardDelta <= 35f -> score += 3
-            forwardDelta <= 60f -> score += 2
-            forwardDelta <= 85f -> score += 1
-            else ->
-                reasons +=
-                    if (forwardDelta >= PASS_BEHIND_DEG) {
-                        "behind_vehicle"
-                    } else {
-                        "forward_angle"
-                    }
-        }
-
-        if (vehicleForward > 10f) {
-            score += 1
-        } else {
-            reasons += "not_ahead"
-        }
+        if (vehicleForward > 8f) score += 1 else reasons += "not_ahead"
 
         if (approachDelta > 2f) {
             score += 2
@@ -1272,6 +1557,10 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         when {
             latestAccuracy in 0f..8f -> score += 2
             latestAccuracy in 0f..18f -> score += 1
+        }
+
+        if (!directionGateOk && forwardDelta < PASS_BEHIND_DEG) {
+            reasons += "direction_gate"
         }
 
         val requiredScore =
@@ -1286,8 +1575,9 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val requiredHits =
             when {
                 distance > 850f -> 3
-                distance > 450f -> 2
-                else -> 2
+                distance > 600f -> 3
+                distance > 350f -> 2
+                else -> 1
             }
 
         return CameraGeometry(
@@ -1298,10 +1588,13 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             bearingToCameraDeg = bearingToCamera,
             forwardDeltaDeg = forwardDelta,
             roadCrossM = roadCross,
+            curveCrossM = curveCross,
             roadAxisDeltaDeg = roadAxisDelta,
-            softCrossLimitM = softCrossLimit,
+            roadDirectionDeltaDeg = roadDirectionDelta,
             hardCrossLimitM = hardCrossLimit,
             hardCrossOk = hardCrossOk,
+            directionGateOk = directionGateOk,
+            hardGeometryOk = hardGeometryOk,
             warningDistanceM = warningDistance,
             ttcS = ttc,
             candidateLimit = candidateLimit,
@@ -1310,24 +1603,17 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             matchScore = score,
             requiredScore = requiredScore,
             requiredHits = requiredHits,
-            matchReason =
-                if (reasons.isEmpty()) "good"
-                else reasons.joinToString("+")
+            matchReason = if (reasons.isEmpty()) "good" else reasons.distinct().joinToString("+")
         )
     }
 
-    private fun updateApproachState(
-        state: CameraTrackState,
-        geometry: CameraGeometry
-    ) {
+    private fun updateApproachState(state: CameraTrackState, geometry: CameraGeometry) {
         if (state.lastDistanceM == Float.MAX_VALUE) return
-
         when {
             geometry.approachDeltaM > 2f -> {
                 state.approachHits = min(10, state.approachHits + 1)
                 state.awayHits = max(0, state.awayHits - 1)
             }
-
             geometry.approachDeltaM < -3f -> {
                 state.awayHits = min(10, state.awayHits + 1)
                 state.approachHits = max(0, state.approachHits - 1)
@@ -1335,51 +1621,41 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         }
     }
 
-
     private fun computeAlertRequest(
         geometry: CameraGeometry,
         state: CameraTrackState,
         bridge: Boolean
     ): AlertRequest? {
-
         if (state.phase != TrackPhase.CONFIRMED) return null
-
-        if (
-            geometry.vehicleForwardM <= 0f ||
-            geometry.forwardDeltaDeg >= PASS_BEHIND_DEG
-        ) {
+        if (geometry.vehicleForwardM <= 0f || geometry.forwardDeltaDeg >= PASS_BEHIND_DEG) {
             state.alertLevel = 0
             return null
         }
 
-        // Hard cross is never bypassed by score.
-        if (!geometry.hardCrossOk) {
+        // Hard geometry is never rescued by score. The cross-track itself is now curve-aware.
+        if (!geometry.hardGeometryOk) {
             state.alertLevel = 0
             return null
         }
 
-        val inWarningZone =
-            geometry.vehicleForwardM <=
-                geometry.warningDistanceM + 90f
-
+        val inWarningZone = geometry.vehicleForwardM <= geometry.warningDistanceM + 90f
         if (!inWarningZone) {
             state.alertLevel = 0
             return null
         }
 
-        val level =
-            computeCameraAlertLevel(
-                geometry.vehicleForwardM,
-                geometry.ttcS,
-                latestSpeedKmh,
-                geometry.candidateLimit,
-                geometry.warningDistanceM
-            )
-
+        val level = computeCameraAlertLevel(
+            geometry.vehicleForwardM,
+            geometry.ttcS,
+            latestSpeedKmh,
+            geometry.candidateLimit,
+            geometry.warningDistanceM
+        )
         state.alertLevel = level
 
         if (!state.warned) {
             state.warned = true
+            state.warningStartedElapsed = SystemClock.elapsedRealtime()
             appendCameraEvent(
                 "CAMERA_WARNING",
                 geometry,
@@ -1398,70 +1674,72 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             )
         }
 
-        return AlertRequest(
-            geometry = geometry,
-            state = state,
-            level = level,
-            bridge = bridge
-        )
+        return AlertRequest(geometry, state, level, bridge)
     }
 
-    private fun dispatchBestCameraAlert(
-        requests: List<AlertRequest>
-    ) {
+    private fun dispatchCameraAlerts(requests: List<AlertRequest>) {
         if (requests.isEmpty()) return
-
-        val best =
-            requests.sortedWith(
-                compareByDescending<AlertRequest> { it.level }
-                    .thenBy {
-                        if (it.geometry.ttcS > 0f) {
-                            it.geometry.ttcS
-                        } else {
-                            Float.MAX_VALUE
-                        }
-                    }
-                    .thenBy { it.geometry.vehicleForwardM }
-            ).first()
-
         val now = SystemClock.elapsedRealtime()
 
-        val interval =
-            when (best.level) {
-                1 -> 3000L
-                2 -> 1800L
-                3 -> 900L
-                4 -> 450L
-                else -> Long.MAX_VALUE
+        val sorted = requests.sortedWith(
+            compareByDescending<AlertRequest> { it.level }
+                .thenBy { if (it.geometry.ttcS > 0f) it.geometry.ttcS else Float.MAX_VALUE }
+                .thenBy { it.geometry.vehicleForwardM }
+        )
+
+        // Guarantee the FIRST audible alert for every confirmed physical cluster.
+        // Arbitration may delay it briefly to avoid overlapping tones, but can no longer
+        // suppress it for tens of seconds as happened in 0.9.
+        val pendingFirst = sorted.filter { !it.state.firstAlertDelivered }
+        if (pendingFirst.isNotEmpty()) {
+            val chosen = pendingFirst.first()
+            val pendingAge = now - chosen.state.warningStartedElapsed
+            val globalGap = now - globalLastCameraPulseElapsed
+            if (globalGap >= GLOBAL_ALERT_MIN_GAP_MS || pendingAge >= FIRST_ALERT_FORCE_MS) {
+                globalLastCameraPulseElapsed = now
+                globalLastCameraKey = chosen.geometry.cluster.key
+                chosen.state.firstAlertDelivered = true
+                chosen.state.lastPulseElapsed = now
+                dispatchCameraAlertOutput(
+                    chosen,
+                    max(0, requests.size - 1),
+                    true
+                )
+                return
             }
+        }
 
-        val switchedCluster =
-            best.geometry.cluster.key != globalLastCameraKey
+        val repeatCandidates = sorted.filter {
+            val interval = alertRepeatIntervalMs(it.level)
+            now - it.state.lastPulseElapsed >= interval
+        }
+        if (repeatCandidates.isEmpty()) return
+        if (now - globalLastCameraPulseElapsed < GLOBAL_ALERT_MIN_GAP_MS) return
 
-        val switchReady =
-            switchedCluster &&
-                now - globalLastCameraPulseElapsed >= GLOBAL_ALERT_SWITCH_MIN_MS
-
-        val cadenceReady =
-            now - globalLastCameraPulseElapsed >= interval
-
-        if (!switchReady && !cadenceReady) return
-
+        val chosen = repeatCandidates.first()
         globalLastCameraPulseElapsed = now
-        globalLastCameraKey = best.geometry.cluster.key
-
+        globalLastCameraKey = chosen.geometry.cluster.key
+        chosen.state.lastPulseElapsed = now
         dispatchCameraAlertOutput(
-            best,
-            max(0, requests.size - 1)
+            chosen,
+            max(0, requests.size - 1),
+            false
         )
     }
 
-    private fun bridgeConfirmedCameraAlerts(
-        gpsAgeMs: Long
-    ) {
+    private fun alertRepeatIntervalMs(level: Int): Long =
+        when (level) {
+            1 -> 3000L
+            2 -> 1800L
+            3 -> 900L
+            4 -> 450L
+            else -> Long.MAX_VALUE
+        }
+
+    private fun bridgeConfirmedCameraAlerts(locationAgeMs: Long) {
         if (
-            gpsAgeMs < GPS_CAMERA_BRIDGE_START_MS ||
-            gpsAgeMs > GPS_CAMERA_BRIDGE_MAX_MS
+            locationAgeMs < GPS_CAMERA_BRIDGE_START_MS ||
+            locationAgeMs > GPS_CAMERA_BRIDGE_MAX_MS
         ) {
             return
         }
@@ -1474,47 +1752,36 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         for ((_, state) in cameraStates) {
             if (state.phase != TrackPhase.CONFIRMED) continue
-
             val last = state.lastGeometry ?: continue
-            if (!last.hardCrossOk) continue
+            if (!last.hardGeometryOk) continue
 
             val elapsedS =
-                (now - state.lastGeometryElapsed)
-                    .coerceAtLeast(0L) / 1000f
+                (now - state.lastGeometryElapsed).coerceAtLeast(0L) / 1000f
+            if (elapsedS <= 0f || elapsedS > GPS_CAMERA_BRIDGE_MAX_MS / 1000f) continue
 
-            if (
-                elapsedS <= 0f ||
-                elapsedS >
-                    GPS_CAMERA_BRIDGE_MAX_MS / 1000f
-            ) {
+            val predictedForward = last.vehicleForwardM - speedMps * elapsedS
+            if (predictedForward <= 0f) {
+                if (!state.warned && !state.missedDuringGapLogged) {
+                    state.missedDuringGapLogged = true
+                    appendCameraEvent(
+                        "CAMERA_PREDICTED_PASS_DURING_GPS_GAP",
+                        last,
+                        state,
+                        "locationAgeMs=$locationAgeMs;elapsedS=${String.format(Locale.US, "%.1f", elapsedS)}"
+                    )
+                }
                 continue
             }
 
-            val predictedForward =
-                last.vehicleForwardM -
-                    speedMps * elapsedS
-
-            if (predictedForward <= 0f) continue
-
-            val predictedDirect =
-                max(
-                    0f,
-                    last.directDistanceM -
-                        speedMps * elapsedS
-                )
-
-            val predictedTtc =
-                predictedForward /
-                    max(1.5f, speedMps)
-
-            val bridged =
-                last.copy(
-                    directDistanceM = predictedDirect,
-                    vehicleForwardM = predictedForward,
-                    ttcS = predictedTtc,
-                    approachDeltaM = 0f,
-                    approachRateMps = speedMps
-                )
+            val predictedDirect = max(0f, last.directDistanceM - speedMps * elapsedS)
+            val predictedTtc = predictedForward / max(1.5f, speedMps)
+            val bridged = last.copy(
+                directDistanceM = predictedDirect,
+                vehicleForwardM = predictedForward,
+                ttcS = predictedTtc,
+                approachDeltaM = 0f,
+                approachRateMps = speedMps
+            )
 
             if (!state.bridgeLogged) {
                 state.bridgeLogged = true
@@ -1522,65 +1789,50 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                     "CAMERA_GPS_BRIDGE_START",
                     bridged,
                     state,
-                    "gpsAgeMs=$gpsAgeMs"
+                    "locationAgeMs=$locationAgeMs;maxBridgeMs=$GPS_CAMERA_BRIDGE_MAX_MS"
                 )
             }
 
-            computeAlertRequest(
-                bridged,
-                state,
-                true
-            )?.let {
-                requests += it
-            }
+            computeAlertRequest(bridged, state, true)?.let { requests += it }
         }
 
         if (requests.isNotEmpty()) {
             cameraAlertZoneActive = true
-            dispatchBestCameraAlert(requests)
+            dispatchCameraAlerts(requests)
         }
     }
 
-    private fun chooseUiCamera(
-        geometries: List<CameraGeometry>
-    ) {
-        val ahead =
-            geometries.filter {
-                it.vehicleForwardM > 0f &&
-                    it.forwardDeltaDeg < PASS_BEHIND_DEG &&
-                    it.hardCrossOk
-            }
+    private fun chooseUiCamera(geometries: List<CameraGeometry>) {
+        val ahead = geometries.filter {
+            it.vehicleForwardM > 0f &&
+                it.forwardDeltaDeg < PASS_BEHIND_DEG &&
+                it.hardGeometryOk
+        }
 
         if (ahead.isEmpty()) {
             clearUiCamera()
             return
         }
 
-        val best =
-            ahead.minByOrNull {
-                if (it.ttcS > 0f) it.ttcS
-                else Float.MAX_VALUE
-            } ?: run {
-                clearUiCamera()
-                return
-            }
+        val best = ahead.minByOrNull {
+            if (it.ttcS > 0f) it.ttcS else Float.MAX_VALUE
+        } ?: run {
+            clearUiCamera()
+            return
+        }
 
-        val state =
-            cameraStates[best.cluster.key]
-
+        val state = cameraStates[best.cluster.key]
         activeCameraId =
             if (best.cluster.memberIds.size > 1) {
-                best.cluster.camera.id +
-                    "(+${best.cluster.memberIds.size - 1})"
+                best.cluster.camera.id + "(+${best.cluster.memberIds.size - 1})"
             } else {
                 best.cluster.camera.id
             }
-
         activeCameraType = best.cluster.camera.type
         activeCameraDistanceM = best.vehicleForwardM
         activeCameraSpeedLimit = best.candidateLimit
         activeCameraRoadName = best.cluster.camera.roadName
-        activeCameraRoadCrossM = best.roadCrossM
+        activeCameraCurveCrossM = best.curveCrossM
         activeCameraForwardDelta = best.forwardDeltaDeg
         activeCameraAlertLevel = state?.alertLevel ?: 0
         activeCameraTtcS = best.ttcS
@@ -1588,8 +1840,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         activeLimitKmh =
             if (
-                best.vehicleForwardM <=
-                    best.warningDistanceM + 90f &&
+                best.vehicleForwardM <= best.warningDistanceM + 90f &&
                 best.candidateLimit != null
             ) {
                 best.candidateLimit
@@ -1604,7 +1855,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         activeCameraDistanceM = -1f
         activeCameraSpeedLimit = null
         activeCameraRoadName = ""
-        activeCameraRoadCrossM = -1f
+        activeCameraCurveCrossM = -1f
         activeCameraForwardDelta = -1f
         activeCameraAlertLevel = 0
         activeCameraTtcS = -1f
@@ -1617,12 +1868,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val iterator = cameraStates.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
-            if (
-                now - entry.value.lastSeenElapsed >
-                180_000L
-            ) {
-                iterator.remove()
-            }
+            if (now - entry.value.lastSeenElapsed > 180_000L) iterator.remove()
         }
     }
 
@@ -1631,41 +1877,19 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         cameraLimitKmh: Int?,
         cameraType: String
     ): Float {
-
         val v = max(5f, speedKmh) / 3.6f
-
         val baseLeadS =
-            (
-                24f +
-                    (speedKmh - 45f)
-                        .coerceAtLeast(0f) *
-                        0.12f
-                ).coerceIn(24f, 32f)
+            (24f + (speedKmh - 45f).coerceAtLeast(0f) * 0.12f)
+                .coerceIn(24f, 32f)
 
         var warningM = v * baseLeadS
 
-        if (
-            cameraLimitKmh != null &&
-            speedKmh > cameraLimitKmh
-        ) {
-            val target =
-                cameraLimitKmh / 3.6f
-
+        if (cameraLimitKmh != null && speedKmh > cameraLimitKmh) {
+            val target = cameraLimitKmh / 3.6f
             val decelDistance =
-                (
-                    (v * v - target * target) /
-                        (2f * 1.6f)
-                    ).coerceAtLeast(0f)
-
+                ((v * v - target * target) / (2f * 1.6f)).coerceAtLeast(0f)
             val reactionDistance = v * 5f
-
-            warningM =
-                max(
-                    warningM,
-                    decelDistance +
-                        reactionDistance +
-                        90f
-                )
+            warningM = max(warningM, decelDistance + reactionDistance + 90f)
         }
 
         if (cameraType == "red_light") {
@@ -1682,173 +1906,90 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         cameraLimitKmh: Int?,
         warningDistanceM: Float
     ): Int {
-
-        val overLimit =
-            cameraLimitKmh != null &&
-                speedKmh >
-                    cameraLimitKmh + 2f
-
+        val overLimit = cameraLimitKmh != null && speedKmh > cameraLimitKmh + 2f
         return when {
-            (
-                ttcS in 0f..6f ||
-                    forwardM <= 140f
-                ) &&
-                overLimit ->
-                4
-
-            ttcS in 0f..9f ||
-                forwardM <= 220f ->
-                3
-
-            ttcS in 0f..15f ||
-                forwardM <=
-                    min(
-                        420f,
-                        warningDistanceM * 0.72f
-                    ) ->
-                2
-
-            else ->
-                1
+            (ttcS in 0f..6f || forwardM <= 140f) && overLimit -> 4
+            ttcS in 0f..9f || forwardM <= 220f -> 3
+            ttcS in 0f..15f || forwardM <= min(420f, warningDistanceM * 0.72f) -> 2
+            else -> 1
         }
     }
 
     private fun dispatchCameraAlertOutput(
         request: AlertRequest,
-        suppressedCount: Int
+        suppressedCount: Int,
+        firstAlert: Boolean
     ) {
         val geometry = request.geometry
         val level = request.level
-
-        val tone =
-            when (level) {
-                1 -> toneLow
-                2 -> toneMid
-                else -> toneHigh
-            }
-
-        val duration =
-            when (level) {
-                1 -> 120
-                2 -> 170
-                3 -> 240
-                else -> 360
-            }
-
+        val tone = when (level) {
+            1 -> toneLow
+            2 -> toneMid
+            else -> toneHigh
+        }
+        val duration = when (level) {
+            1 -> 120
+            2 -> 170
+            3 -> 240
+            else -> 360
+        }
         val toneId =
-            if (
-                geometry.cluster.camera.type ==
-                "red_light"
-            ) {
+            if (geometry.cluster.camera.type == "red_light") {
                 ToneGenerator.TONE_PROP_ACK
             } else {
                 ToneGenerator.TONE_PROP_BEEP2
             }
 
-        val toneOk =
-            try {
-                tone?.startTone(
-                    toneId,
-                    duration
-                ) ?: false
-            } catch (_: Exception) {
-                false
-            }
+        val toneOk = try {
+            tone?.startTone(toneId, duration) ?: false
+        } catch (_: Exception) {
+            false
+        }
 
-        val vibrator =
-            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-
-        val vibratorPresent =
-            try {
-                vibrator.hasVibrator()
-            } catch (_: Exception) {
-                false
-            }
-
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        val vibratorPresent = try { vibrator.hasVibrator() } catch (_: Exception) { false }
         var vibrationDispatched = false
 
         if (vibratorPresent) {
             try {
                 when (level) {
-                    1 ->
-                        vibratePattern(
-                            longArrayOf(0, 70),
-                            intArrayOf(0, 120)
-                        )
-
-                    2 ->
-                        vibratePattern(
-                            longArrayOf(0, 110),
-                            intArrayOf(0, 180)
-                        )
-
-                    3 ->
-                        vibratePattern(
-                            longArrayOf(0, 140),
-                            intArrayOf(0, 230)
-                        )
-
-                    else ->
-                        vibratePattern(
-                            longArrayOf(0, 200, 70, 200),
-                            intArrayOf(0, 255, 0, 255)
-                        )
+                    1 -> vibratePattern(longArrayOf(0, 70), intArrayOf(0, 120))
+                    2 -> vibratePattern(longArrayOf(0, 110), intArrayOf(0, 180))
+                    3 -> vibratePattern(longArrayOf(0, 140), intArrayOf(0, 230))
+                    else -> vibratePattern(
+                        longArrayOf(0, 200, 70, 200),
+                        intArrayOf(0, 255, 0, 255)
+                    )
                 }
-
                 vibrationDispatched = true
             } catch (_: Exception) {}
         }
 
-        val alarmVolume =
-            try {
-                audioManager.getStreamVolume(
-                    AudioManager.STREAM_ALARM
-                )
-            } catch (_: Exception) {
-                -1
-            }
-
-        val alarmMax =
-            try {
-                audioManager.getStreamMaxVolume(
-                    AudioManager.STREAM_ALARM
-                )
-            } catch (_: Exception) {
-                -1
-            }
+        val alarmVolume = try {
+            audioManager.getStreamVolume(AudioManager.STREAM_ALARM)
+        } catch (_: Exception) { -1 }
+        val alarmMax = try {
+            audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+        } catch (_: Exception) { -1 }
 
         appendCameraEvent(
             "ALERT_OUTPUT",
             geometry,
             request.state,
-            "level=$level;" +
-                "bridge=${request.bridge};" +
-                "tone_start_ok=$toneOk;" +
-                "vibrator_present=$vibratorPresent;" +
-                "vibration_dispatched=$vibrationDispatched;" +
-                "alarm_volume=$alarmVolume;" +
-                "alarm_max=$alarmMax;" +
-                "suppressed_other_camera_alerts=$suppressedCount;" +
-                "stream=ALARM;" +
-                "duration_ms=$duration"
+            "level=$level;bridge=${request.bridge};first_alert=$firstAlert;" +
+                "tone_start_ok=$toneOk;vibrator_present=$vibratorPresent;" +
+                "vibration_dispatched=$vibrationDispatched;alarm_volume=$alarmVolume;" +
+                "alarm_max=$alarmMax;suppressed_other_camera_alerts=$suppressedCount;" +
+                "stream=ALARM;duration_ms=$duration"
         )
     }
 
-    private fun validDynamicLimit(
-        camera: CameraPoint
-    ): Int? {
-
+    private fun validDynamicLimit(camera: CameraPoint): Int? {
         val limit = camera.speedLimit ?: return null
-        val confidence =
-            camera.speedConfidence.lowercase(Locale.US)
-
+        val confidence = camera.speedConfidence.lowercase(Locale.US)
         if (limit !in 20..150) return null
-        if (
-            confidence != "high" &&
-            confidence != "medium"
-        ) return null
+        if (confidence != "high" && confidence != "medium") return null
         if ((camera.roadDistanceM ?: 999.0) > 30.0) return null
-
         return limit
     }
 
@@ -1863,18 +2004,21 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             Float.NaN, Float.NaN, Float.NaN, Float.NaN,
             0L,
             !gpsStale,
+            latestSpeedEstimateReliable,
             "cluster=${geometry.cluster.key};" +
                 "memberIds=${geometry.cluster.memberIds.joinToString("|")};" +
                 "direct=${String.format(Locale.US, "%.1f", geometry.directDistanceM)};" +
                 "forward=${String.format(Locale.US, "%.1f", geometry.vehicleForwardM)};" +
                 "vehicleCross=${String.format(Locale.US, "%.1f", geometry.vehicleCrossM)};" +
                 "roadCross=${String.format(Locale.US, "%.1f", geometry.roadCrossM)};" +
-                "softCross=${String.format(Locale.US, "%.1f", geometry.softCrossLimitM)};" +
-                "hardCross=${String.format(Locale.US, "%.1f", geometry.hardCrossLimitM)};" +
-                "hardCrossOk=${geometry.hardCrossOk};" +
+                "curveCross=${String.format(Locale.US, "%.1f", geometry.curveCrossM)};" +
+                "hardCrossLimit=${String.format(Locale.US, "%.1f", geometry.hardCrossLimitM)};" +
+                "hardCrossOk=${geometry.hardCrossOk};directionGateOk=${geometry.directionGateOk};" +
+                "hardGeometryOk=${geometry.hardGeometryOk};" +
                 "bearingTo=${String.format(Locale.US, "%.1f", geometry.bearingToCameraDeg)};" +
                 "forwardDelta=${String.format(Locale.US, "%.1f", geometry.forwardDeltaDeg)};" +
                 "axisDelta=${String.format(Locale.US, "%.1f", geometry.roadAxisDeltaDeg)};" +
+                "directionDelta=${String.format(Locale.US, "%.1f", geometry.roadDirectionDeltaDeg)};" +
                 "approachDelta=${String.format(Locale.US, "%.1f", geometry.approachDeltaM)};" +
                 "approachRate=${String.format(Locale.US, "%.1f", geometry.approachRateMps)};" +
                 "score=${geometry.matchScore};requiredScore=${geometry.requiredScore};" +
@@ -1897,62 +2041,39 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     }
 
     private fun handleOverspeed(speedKmh: Float) {
-        if (gpsStale) return
+        if (gpsStale || !latestSpeedEstimateReliable) return
 
-        if (
-            abs(activeLimitKmh - lastAlertLimitKmh) >= 3
-        ) {
+        if (abs(activeLimitKmh - lastAlertLimitKmh) >= 3) {
             overspeedActive = false
             lastAlertLimitKmh = activeLimitKmh
         }
 
         val now = SystemClock.elapsedRealtime()
-
         if (speedKmh >= activeLimitKmh + 1f) {
-            if (
-                !overspeedActive ||
-                now - lastOverspeedAlertElapsed >= OVERSPEED_REPEAT_MS
-            ) {
+            if (!overspeedActive || now - lastOverspeedAlertElapsed >= OVERSPEED_REPEAT_MS) {
                 overspeedActive = true
                 lastOverspeedAlertElapsed = now
 
-                if (!cameraAlertZoneActive) {
-                    overspeedAlert()
-                }
-
+                if (!cameraAlertZoneActive) overspeedAlert()
                 appendMarker(
                     "OVERSPEED_ALERT",
                     "speed=${speedKmh.roundToInt()};limit=$activeLimitKmh;camera=$activeCameraId"
                 )
             }
-        } else if (
-            speedKmh <= activeLimitKmh - 4f
-        ) {
+        } else if (speedKmh <= activeLimitKmh - 4f) {
             overspeedActive = false
         }
     }
 
     private fun overspeedAlert() {
-        val toneOk =
-            try {
-                toneHigh?.startTone(
-                    ToneGenerator.TONE_PROP_BEEP2,
-                    500
-                ) ?: false
-            } catch (_: Exception) {
-                false
-            }
+        val toneOk = try {
+            toneHigh?.startTone(ToneGenerator.TONE_PROP_BEEP2, 500) ?: false
+        } catch (_: Exception) {
+            false
+        }
 
-        val vibrator =
-            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-
-        val hasVibrator =
-            try {
-                vibrator.hasVibrator()
-            } catch (_: Exception) {
-                false
-            }
-
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        val hasVibrator = try { vibrator.hasVibrator() } catch (_: Exception) { false }
         var vibrationDispatched = false
 
         if (hasVibrator) {
@@ -1965,53 +2086,29 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             } catch (_: Exception) {}
         }
 
-        val alarmVolume =
-            try {
-                audioManager.getStreamVolume(
-                    AudioManager.STREAM_ALARM
-                )
-            } catch (_: Exception) {
-                -1
-            }
-
-        val alarmMax =
-            try {
-                audioManager.getStreamMaxVolume(
-                    AudioManager.STREAM_ALARM
-                )
-            } catch (_: Exception) {
-                -1
-            }
+        val alarmVolume = try {
+            audioManager.getStreamVolume(AudioManager.STREAM_ALARM)
+        } catch (_: Exception) { -1 }
+        val alarmMax = try {
+            audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+        } catch (_: Exception) { -1 }
 
         appendMarker(
             "OVERSPEED_OUTPUT",
             "tone_start_ok=$toneOk;vibrator_present=$hasVibrator;" +
-                "vibration_dispatched=$vibrationDispatched;" +
-                "alarm_volume=$alarmVolume;alarm_max=$alarmMax"
+                "vibration_dispatched=$vibrationDispatched;alarm_volume=$alarmVolume;alarm_max=$alarmMax"
         )
     }
 
-    private fun vibratePattern(
-        timings: LongArray,
-        amplitudes: IntArray
-    ) {
-        val vibrator =
-            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-
+    private fun vibratePattern(timings: LongArray, amplitudes: IntArray) {
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         if (Build.VERSION.SDK_INT >= 26) {
-            vibrator.vibrate(
-                VibrationEffect.createWaveform(
-                    timings,
-                    amplitudes,
-                    -1
-                )
-            )
+            vibrator.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
         } else {
             @Suppress("DEPRECATION")
             vibrator.vibrate(timings, -1)
         }
     }
-
 
     override fun onSensorChanged(event: SensorEvent) {
         if (event.values.size < 3) return
@@ -2021,18 +2118,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 if (
                     lastRotationProcessNs > 0L &&
                     event.timestamp - lastRotationProcessNs < SENSOR_PROCESS_PERIOD_NS
-                ) {
-                    return
-                }
+                ) return
 
                 lastRotationProcessNs = event.timestamp
                 rotationProcessedCount++
-
                 try {
-                    SensorManager.getRotationMatrixFromVector(
-                        rotationMatrix,
-                        event.values
-                    )
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
                     rotationReady = true
                 } catch (_: Exception) {
                     rotationReady = false
@@ -2043,9 +2134,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 if (
                     lastLinearProcessNs > 0L &&
                     event.timestamp - lastLinearProcessNs < SENSOR_PROCESS_PERIOD_NS
-                ) {
-                    return
-                }
+                ) return
 
                 lastLinearProcessNs = event.timestamp
                 linearProcessedCount++
@@ -2056,61 +2145,32 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 if (
                     lastGyroProcessNs > 0L &&
                     event.timestamp - lastGyroProcessNs < SENSOR_PROCESS_PERIOD_NS
-                ) {
-                    return
-                }
+                ) return
 
                 lastGyroProcessNs = event.timestamp
                 gyroProcessedCount++
-
                 val gx = event.values[0]
                 val gy = event.values[1]
                 val gz = event.values[2]
-
-                latestGyroMagnitude =
-                    sqrt(
-                        (
-                            gx * gx +
-                                gy * gy +
-                                gz * gz
-                            ).toDouble()
-                    ).toFloat()
+                latestGyroMagnitude = sqrt((gx * gx + gy * gy + gz * gz).toDouble()).toFloat()
             }
 
             Sensor.TYPE_ACCELEROMETER -> {
                 if (
                     lastAccelProcessNs > 0L &&
                     event.timestamp - lastAccelProcessNs < SENSOR_PROCESS_PERIOD_NS
-                ) {
-                    return
-                }
+                ) return
 
                 lastAccelProcessNs = event.timestamp
                 accelProcessedCount++
-
                 if (!loggingStarted) return
 
                 val x = event.values[0]
                 val y = event.values[1]
                 val z = event.values[2]
-
-                val magnitude =
-                    sqrt(
-                        (
-                            x * x +
-                                y * y +
-                                z * z
-                            ).toDouble()
-                    ).toFloat()
-
-                val shock =
-                    abs(
-                        magnitude -
-                            SensorManager.GRAVITY_EARTH
-                    )
-
-                val now =
-                    SystemClock.elapsedRealtime()
+                val magnitude = sqrt((x * x + y * y + z * z).toDouble()).toFloat()
+                val shock = abs(magnitude - SensorManager.GRAVITY_EARTH)
+                val now = SystemClock.elapsedRealtime()
 
                 if (
                     latestSpeedKmh >= 8f &&
@@ -2118,25 +2178,26 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                     now - lastRoadImpactElapsed >= ROAD_IMPACT_COOLDOWN_MS
                 ) {
                     lastRoadImpactElapsed = now
+                    val severity = when {
+                        shock >= 7.0f -> "severe"
+                        shock >= 5.0f -> "strong"
+                        shock >= 4.0f -> "medium"
+                        else -> "light"
+                    }
 
-                    val severity =
-                        when {
-                            shock >= 7.0f -> "severe"
-                            shock >= 5.0f -> "strong"
-                            shock >= 4.0f -> "medium"
-                            else -> "light"
-                        }
-
+                    val locationFresh = currentGpsAgeMs() in 0L..3000L
                     appendRow(
-                        "ROAD_IMPACT_CANDIDATE",
+                        if (locationFresh) "ROAD_IMPACT_CANDIDATE" else "ROAD_IMPACT_UNLOCATED",
                         x, y, z, magnitude,
                         event.timestamp,
-                        !gpsStale,
+                        locationFresh,
+                        latestSpeedEstimateReliable,
                         "shock=${String.format(Locale.US, "%.2f", shock)};" +
                             "gyroMag=${String.format(Locale.US, "%.3f", latestGyroMagnitude)};" +
                             "speed=${String.format(Locale.US, "%.1f", latestSpeedKmh)};" +
-                            "severity=$severity",
-                        null
+                            "severity=$severity;locationFresh=$locationFresh",
+                        null,
+                        includePosition = locationFresh
                     )
                 }
             }
@@ -2147,7 +2208,6 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         if (!loggingStarted) return
 
         val now = SystemClock.elapsedRealtime()
-
         if (lastSensorHealthElapsed == 0L) {
             lastSensorHealthElapsed = now
             return
@@ -2157,11 +2217,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         if (elapsed < SENSOR_HEALTH_LOG_MS) return
 
         val seconds = elapsed / 1000f
-
         val accelHz = accelProcessedCount / max(0.1f, seconds)
         val gyroHz = gyroProcessedCount / max(0.1f, seconds)
         val linearHz = linearProcessedCount / max(0.1f, seconds)
         val rotationHz = rotationProcessedCount / max(0.1f, seconds)
+        val gnssStatusAge =
+            if (lastGnssStatusElapsedMs > 0L) now - lastGnssStatusElapsedMs else -1L
 
         appendMarker(
             "SENSOR_HEALTH",
@@ -2169,7 +2230,10 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 "gyroHz=${String.format(Locale.US, "%.1f", gyroHz)};" +
                 "linearHz=${String.format(Locale.US, "%.1f", linearHz)};" +
                 "rotationHz=${String.format(Locale.US, "%.1f", rotationHz)};" +
-                "rawSensorCsv=false"
+                "rawSensorCsv=false;locationAgeMs=${currentGpsAgeMs()};" +
+                "speedAgeMs=${currentGpsSpeedAgeMs()};callbackAgeMs=${currentGpsCallbackAgeMs()};" +
+                "satellites=$gnssSatellites;used=$gnssUsedInFix;gnssStatusAgeMs=$gnssStatusAge;" +
+                "watchdogCount=$gpsWatchdogCount"
         )
 
         accelProcessedCount = 0
@@ -2179,23 +2243,17 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         lastSensorHealthElapsed = now
     }
 
-    override fun onAccuracyChanged(
-        sensor: Sensor?,
-        accuracy: Int
-    ) = Unit
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     @Synchronized
-    private fun appendMarker(
-        marker: String,
-        details: String = ""
-    ) {
+    private fun appendMarker(marker: String, details: String = "") {
         if (!::logFile.isInitialized) return
-
         appendRow(
             marker,
             Float.NaN, Float.NaN, Float.NaN, Float.NaN,
             0L,
             !gpsStale,
+            latestSpeedEstimateReliable,
             details,
             null
         )
@@ -2209,228 +2267,134 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         z: Float,
         magnitude: Float,
         sensorTimestampNs: Long,
+        locationValid: Boolean,
         speedValid: Boolean,
         details: String,
-        cameraGeometry: CameraGeometry?
+        cameraGeometry: CameraGeometry?,
+        includePosition: Boolean = true
     ) {
         if (!::logFile.isInitialized) return
 
         val wall = System.currentTimeMillis()
-        val iso =
-            SimpleDateFormat(
-                "yyyy-MM-dd'T'HH:mm:ss.SSS",
-                Locale.US
-            ).format(Date(wall))
+        val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS", Locale.US).format(Date(wall))
 
         val lat =
-            if (latestLat.isNaN()) ""
+            if (!includePosition || latestLat.isNaN()) ""
             else String.format(Locale.US, "%.7f", latestLat)
-
         val lon =
-            if (latestLon.isNaN()) ""
+            if (!includePosition || latestLon.isNaN()) ""
             else String.format(Locale.US, "%.7f", latestLon)
 
-        val gpsAge = currentGpsAgeMs()
-
         val rawSpeed =
-            if (latestRawSpeedKmh.isNaN()) ""
-            else String.format(Locale.US, "%.3f", latestRawSpeedKmh)
-
+            if (latestRawSpeedKmh.isNaN()) "" else String.format(Locale.US, "%.3f", latestRawSpeedKmh)
         val gpsFiltered =
-            if (latestGpsFilteredKmh.isNaN()) ""
-            else String.format(Locale.US, "%.3f", latestGpsFilteredKmh)
-
-        val fusedSpeed =
-            String.format(Locale.US, "%.3f", latestSpeedKmh)
-
-        val forwardAccel =
-            String.format(Locale.US, "%.4f", latestForwardAccelMps2)
-
+            if (latestGpsFilteredKmh.isNaN()) "" else String.format(Locale.US, "%.3f", latestGpsFilteredKmh)
+        val derivedSpeed =
+            if (latestDerivedSpeedKmh.isNaN()) "" else String.format(Locale.US, "%.3f", latestDerivedSpeedKmh)
+        val fusedSpeed = String.format(Locale.US, "%.3f", latestSpeedKmh)
+        val forwardAccel = String.format(Locale.US, "%.4f", latestForwardAccelMps2)
         val bearing =
-            if (latestBearingValid) {
-                String.format(Locale.US, "%.3f", latestBearing)
-            } else {
-                ""
-            }
+            if (latestBearingValid) String.format(Locale.US, "%.3f", latestBearing) else ""
 
         val cg = cameraGeometry
         val camera = cg?.cluster?.camera
-
         val cameraId =
-            if (cg != null) {
-                cg.cluster.memberIds.joinToString("|")
-            } else {
-                activeCameraId
-            }
-
-        val cameraType =
-            camera?.type ?: activeCameraType
-
-        val cameraLat =
-            camera?.latitude?.let {
-                String.format(Locale.US, "%.7f", it)
-            } ?: ""
-
-        val cameraLon =
-            camera?.longitude?.let {
-                String.format(Locale.US, "%.7f", it)
-            } ?: ""
-
-        val directDistance =
-            cg?.directDistanceM?.let {
-                String.format(Locale.US, "%.2f", it)
-            } ?: ""
-
-        val vehicleForward =
-            cg?.vehicleForwardM?.let {
-                String.format(Locale.US, "%.2f", it)
-            } ?: ""
-
-        val vehicleCross =
-            cg?.vehicleCrossM?.let {
-                String.format(Locale.US, "%.2f", it)
-            } ?: ""
-
-        val roadCross =
-            cg?.roadCrossM?.let {
-                String.format(Locale.US, "%.2f", it)
-            } ?: ""
-
-        val bearingTo =
-            cg?.bearingToCameraDeg?.let {
-                String.format(Locale.US, "%.2f", it)
-            } ?: ""
-
-        val forwardDelta =
-            cg?.forwardDeltaDeg?.let {
-                String.format(Locale.US, "%.2f", it)
-            } ?: ""
-
-        val axisDelta =
-            cg?.roadAxisDeltaDeg?.let {
-                String.format(Locale.US, "%.2f", it)
-            } ?: ""
-
-        val matchScore =
-            cg?.matchScore?.toString() ?: ""
-
-        val requiredScore =
-            cg?.requiredScore?.toString() ?: ""
-
+            if (cg != null) cg.cluster.memberIds.joinToString("|") else activeCameraId
+        val cameraType = camera?.type ?: activeCameraType
+        val cameraLat = camera?.latitude?.let { String.format(Locale.US, "%.7f", it) } ?: ""
+        val cameraLon = camera?.longitude?.let { String.format(Locale.US, "%.7f", it) } ?: ""
+        val directDistance = cg?.directDistanceM?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val vehicleForward = cg?.vehicleForwardM?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val vehicleCross = cg?.vehicleCrossM?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val roadCross = cg?.roadCrossM?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val curveCross = cg?.curveCrossM?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val bearingTo = cg?.bearingToCameraDeg?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val forwardDelta = cg?.forwardDeltaDeg?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val axisDelta = cg?.roadAxisDeltaDeg?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val directionDelta = cg?.roadDirectionDeltaDeg?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val hardGeometryOk = cg?.hardGeometryOk?.toString() ?: ""
+        val matchScore = cg?.matchScore?.toString() ?: ""
+        val requiredScore = cg?.requiredScore?.toString() ?: ""
         val confirmed =
             if (cg != null) {
-                (
-                    cameraStates[cg.cluster.key]?.phase ==
-                        TrackPhase.CONFIRMED
-                    ).toString()
+                (cameraStates[cg.cluster.key]?.phase == TrackPhase.CONFIRMED).toString()
             } else {
                 activeCameraId.isNotEmpty().toString()
             }
-
         val alertLevel =
-            if (cg != null) {
-                cameraStates[cg.cluster.key]?.alertLevel?.toString() ?: "0"
-            } else {
-                activeCameraAlertLevel.toString()
-            }
+            if (cg != null) cameraStates[cg.cluster.key]?.alertLevel?.toString() ?: "0"
+            else activeCameraAlertLevel.toString()
+        val ttc = cg?.ttcS?.takeIf { it >= 0f }?.let { String.format(Locale.US, "%.2f", it) } ?: ""
+        val warningDistance = cg?.warningDistanceM?.let { String.format(Locale.US, "%.1f", it) } ?: ""
+        val cameraLimit = cg?.candidateLimit?.toString() ?: activeCameraSpeedLimit?.toString() ?: ""
 
-        val ttc =
-            cg?.ttcS
-                ?.takeIf { it >= 0f }
-                ?.let { String.format(Locale.US, "%.2f", it) }
-                ?: ""
+        val sx = if (x.isNaN()) "" else String.format(Locale.US, "%.6f", x)
+        val sy = if (y.isNaN()) "" else String.format(Locale.US, "%.6f", y)
+        val sz = if (z.isNaN()) "" else String.format(Locale.US, "%.6f", z)
+        val sm = if (magnitude.isNaN()) "" else String.format(Locale.US, "%.6f", magnitude)
 
-        val warningDistance =
-            cg?.warningDistanceM?.let {
-                String.format(Locale.US, "%.1f", it)
-            } ?: ""
-
-        val cameraLimit =
-            cg?.candidateLimit?.toString()
-                ?: activeCameraSpeedLimit?.toString()
-                ?: ""
-
-        val sx =
-            if (x.isNaN()) ""
-            else String.format(Locale.US, "%.6f", x)
-
-        val sy =
-            if (y.isNaN()) ""
-            else String.format(Locale.US, "%.6f", y)
-
-        val sz =
-            if (z.isNaN()) ""
-            else String.format(Locale.US, "%.6f", z)
-
-        val sm =
-            if (magnitude.isNaN()) ""
-            else String.format(Locale.US, "%.6f", magnitude)
-
-        val row =
-            listOf(
-                wall.toString(),
-                iso,
-                recordType,
-                lat,
-                lon,
-                latestProvider,
-                gpsAge.toString(),
-                gpsStale.toString(),
-                speedValid.toString(),
-                rawSpeed,
-                gpsFiltered,
-                fusedSpeed,
-                forwardAccel,
-                fusionActive.toString(),
-                imuBridgeActive.toString(),
-                bearing,
-                latestBearingValid.toString(),
-                String.format(Locale.US, "%.2f", latestAccuracy),
-
-                cameraId,
-                cameraType,
-                cameraLat,
-                cameraLon,
-                directDistance,
-                vehicleForward,
-                vehicleCross,
-                roadCross,
-                bearingTo,
-                forwardDelta,
-                axisDelta,
-                matchScore,
-                requiredScore,
-                confirmed,
-                alertLevel,
-                ttc,
-                warningDistance,
-                cameraLimit,
-                activeLimitKmh.toString(),
-
-                sx,
-                sy,
-                sz,
-                sm,
-                sensorTimestampNs.toString(),
-                details
-            ).joinToString(",") {
-                csvEscape(it)
-            }
+        val row = listOf(
+            wall.toString(),
+            iso,
+            recordType,
+            lat,
+            lon,
+            latestProvider,
+            currentGpsAgeMs().toString(),
+            currentGpsSpeedAgeMs().toString(),
+            currentGpsCallbackAgeMs().toString(),
+            gpsStale.toString(),
+            locationValid.toString(),
+            speedValid.toString(),
+            rawSpeed,
+            gpsFiltered,
+            derivedSpeed,
+            fusedSpeed,
+            forwardAccel,
+            fusionActive.toString(),
+            imuBridgeActive.toString(),
+            bearing,
+            latestBearingValid.toString(),
+            String.format(Locale.US, "%.2f", latestAccuracy),
+            gnssSatellites.toString(),
+            gnssUsedInFix.toString(),
+            cameraId,
+            cameraType,
+            cameraLat,
+            cameraLon,
+            directDistance,
+            vehicleForward,
+            vehicleCross,
+            roadCross,
+            curveCross,
+            bearingTo,
+            forwardDelta,
+            axisDelta,
+            directionDelta,
+            hardGeometryOk,
+            matchScore,
+            requiredScore,
+            confirmed,
+            alertLevel,
+            ttc,
+            warningDistance,
+            cameraLimit,
+            activeLimitKmh.toString(),
+            sx,
+            sy,
+            sz,
+            sm,
+            sensorTimestampNs.toString(),
+            details
+        ).joinToString(",") { csvEscape(it) }
 
         val line = row + "\n"
-
-        try {
-            logFile.appendText(line)
-        } catch (_: Exception) {}
+        try { logFile.appendText(line) } catch (_: Exception) {}
 
         try {
             liveWriter?.write(line)
             val now = SystemClock.elapsedRealtime()
-
-            if (
-                now - lastLiveFlushElapsed >=
-                LIVE_LOG_FLUSH_MS
-            ) {
+            if (now - lastLiveFlushElapsed >= LIVE_LOG_FLUSH_MS) {
                 liveWriter?.flush()
                 lastLiveFlushElapsed = now
             }
@@ -2438,57 +2402,44 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     }
 
     private fun csvEscape(s: String): String {
-        if (
-            !s.contains(',') &&
-            !s.contains('"') &&
-            !s.contains('\n')
-        ) {
-            return s
-        }
-
-        return "\"" +
-            s.replace("\"", "\"\"") +
-            "\""
+        if (!s.contains(',') && !s.contains('"') && !s.contains('\n')) return s
+        return "\"" + s.replace("\"", "\"\"") + "\""
     }
 
     private fun updatePrefs() {
-        val age = currentGpsAgeMs()
-
         prefs.edit()
-            .putBoolean("running", true)
+            .putBoolean("running", serviceTrackingActive)
             .putFloat("speed_kmh", latestSpeedKmh)
-            .putFloat(
-                "raw_speed_kmh",
-                if (latestRawSpeedKmh.isNaN()) -1f else latestRawSpeedKmh
-            )
-            .putFloat(
-                "gps_filtered_kmh",
-                if (latestGpsFilteredKmh.isNaN()) -1f else latestGpsFilteredKmh
-            )
+            .putFloat("raw_speed_kmh", if (latestRawSpeedKmh.isNaN()) -1f else latestRawSpeedKmh)
+            .putFloat("gps_filtered_kmh", if (latestGpsFilteredKmh.isNaN()) -1f else latestGpsFilteredKmh)
+            .putFloat("derived_speed_kmh", if (latestDerivedSpeedKmh.isNaN()) -1f else latestDerivedSpeedKmh)
             .putFloat("forward_accel_mps2", latestForwardAccelMps2)
             .putBoolean("fusion_active", fusionActive)
             .putBoolean("imu_bridge", imuBridgeActive)
             .putString(
                 "lat",
-                if (latestLat.isNaN()) null
-                else String.format(Locale.US, "%.6f", latestLat)
+                if (latestLat.isNaN()) null else String.format(Locale.US, "%.6f", latestLat)
             )
             .putString(
                 "lon",
-                if (latestLon.isNaN()) null
-                else String.format(Locale.US, "%.6f", latestLon)
+                if (latestLon.isNaN()) null else String.format(Locale.US, "%.6f", latestLon)
             )
             .putFloat("accuracy_m", latestAccuracy)
             .putString("provider", latestProvider)
-            .putLong("gps_age_ms", age)
+            .putLong("gps_age_ms", currentGpsAgeMs())
+            .putLong("gps_speed_age_ms", currentGpsSpeedAgeMs())
+            .putLong("gps_callback_age_ms", currentGpsCallbackAgeMs())
             .putBoolean("gps_stale", gpsStale)
+            .putInt("gnss_satellites", gnssSatellites)
+            .putInt("gnss_used_in_fix", gnssUsedInFix)
+            .putInt("gps_watchdog_count", gpsWatchdogCount)
             .putInt("active_limit_kmh", activeLimitKmh)
             .putString("camera_id", activeCameraId)
             .putString("camera_type", activeCameraType)
             .putFloat("camera_distance_m", activeCameraDistanceM)
             .putInt("camera_limit_kmh", activeCameraSpeedLimit ?: -1)
             .putString("camera_road_name", activeCameraRoadName)
-            .putFloat("camera_road_cross_m", activeCameraRoadCrossM)
+            .putFloat("camera_curve_cross_m", activeCameraCurveCrossM)
             .putFloat("camera_forward_delta", activeCameraForwardDelta)
             .putInt("camera_alert_level", activeCameraAlertLevel)
             .putFloat("camera_warning_distance_m", activeCameraWarningDistanceM)
@@ -2500,56 +2451,40 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private fun updateNotification() {
         val cameraPart =
-            if (
-                activeCameraId.isNotEmpty() &&
-                activeCameraDistanceM >= 0f
-            ) {
+            if (activeCameraId.isNotEmpty() && activeCameraDistanceM >= 0f) {
                 " • camera ${activeCameraDistanceM.roundToInt()}m L$activeCameraAlertLevel"
             } else {
                 ""
             }
 
-        val gpsPart =
-            when {
-                gpsStale -> " • GPS stale"
-                imuBridgeActive -> " • IMU bridge"
-                fusionActive -> " • GPS+IMU"
-                else -> ""
-            }
+        val gpsPart = when {
+            gpsStale -> " • GPS stale"
+            imuBridgeActive -> " • speed bridge"
+            fusionActive -> " • GPS+IMU"
+            else -> ""
+        }
 
-        val text =
-            String.format(
-                Locale.US,
-                "%.0f km/h • limit %d%s%s",
-                latestSpeedKmh,
-                activeLimitKmh,
-                cameraPart,
-                gpsPart
-            )
-
-        val nm =
-            getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-        nm.notify(
-            NOTIFICATION_ID,
-            makeNotification(text)
+        val text = String.format(
+            Locale.US,
+            "%.0f km/h • limit %d%s%s",
+            latestSpeedKmh,
+            activeLimitKmh,
+            cameraPart,
+            gpsPart
         )
+
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIFICATION_ID, makeNotification(text))
     }
 
-    private fun makeNotification(
-        text: String
-    ): Notification {
-        val openApp =
-            Intent(this, MainActivity::class.java)
-
-        val pending =
-            PendingIntent.getActivity(
-                this,
-                0,
-                openApp,
-                PendingIntent.FLAG_UPDATE_CURRENT or
-                    PendingIntent.FLAG_IMMUTABLE
-            )
+    private fun makeNotification(text: String): Notification {
+        val openApp = Intent(this, MainActivity::class.java)
+        val pending = PendingIntent.getActivity(
+            this,
+            0,
+            openApp,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("MOJO Drive active • persistent logging")
@@ -2562,49 +2497,71 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            val channel =
-                NotificationChannel(
-                    CHANNEL_ID,
-                    "Driving tracking",
-                    NotificationManager.IMPORTANCE_LOW
-                ).apply {
-                    description =
-                        "Keeps MOJO Drive active while the phone is locked."
-                }
-
-            (
-                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                ).createNotificationChannel(channel)
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Driving tracking",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Keeps MOJO Drive active while the phone is locked."
+            }
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .createNotificationChannel(channel)
         }
     }
 
-    override fun onProviderEnabled(provider: String) = Unit
-    override fun onProviderDisabled(provider: String) = Unit
+    override fun onProviderEnabled(provider: String) {
+        if (provider == LocationManager.GPS_PROVIDER && serviceTrackingActive) {
+            appendMarker("GPS_PROVIDER_ENABLED")
+            requestGpsUpdates("provider_enabled")
+        }
+    }
+
+    override fun onProviderDisabled(provider: String) {
+        if (provider == LocationManager.GPS_PROVIDER) {
+            appendMarker("GPS_PROVIDER_DISABLED")
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (prefs.getBoolean("trip_active", false) && !userStopRequested) {
+            appendMarker("TASK_REMOVED_RESTART_REQUESTED")
+            try {
+                val restart = Intent(applicationContext, LocationService::class.java)
+                    .putExtra(EXTRA_THRESHOLD_KMH, prefs.getInt("threshold_kmh", manualThresholdKmh))
+                if (Build.VERSION.SDK_INT >= 26) {
+                    applicationContext.startForegroundService(restart)
+                } else {
+                    applicationContext.startService(restart)
+                }
+            } catch (e: Exception) {
+                appendMarker("TASK_REMOVED_RESTART_FAILED", "error=${e.javaClass.simpleName}")
+            }
+        }
+        super.onTaskRemoved(rootIntent)
+    }
 
     override fun onDestroy() {
-        handler.removeCallbacks(staleTicker)
+        serviceTrackingActive = false
+        handler.removeCallbacks(healthTicker)
 
         try {
             locationManager.removeUpdates(this)
+            locationUpdatesRegistered = false
         } catch (_: Exception) {}
+
+        if (gnssRegistered) {
+            try { locationManager.unregisterGnssStatusCallback(gnssCallback) } catch (_: Exception) {}
+            gnssRegistered = false
+        }
 
         try {
             sensorManager.unregisterListener(this)
+            sensorsRegistered = false
         } catch (_: Exception) {}
 
-        if (
-            loggingStarted &&
-            !userStopRequested
-        ) {
-            appendMarker(
-                "SERVICE_INTERRUPTED",
-                "trip_will_be_recovered=true"
-            )
-
-            try {
-                liveWriter?.flush()
-            } catch (_: Exception) {}
-
+        if (loggingStarted && !userStopRequested) {
+            appendMarker("SERVICE_INTERRUPTED", "trip_will_be_recovered=true")
+            try { liveWriter?.flush() } catch (_: Exception) {}
             closeLiveWriter()
 
             prefs.edit()
@@ -2623,10 +2580,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         try { toneMid?.release() } catch (_: Exception) {}
         try { toneHigh?.release() } catch (_: Exception) {}
 
-        if (userStopRequested) {
-            prefs.edit().putBoolean("running", false).apply()
-        }
-
+        prefs.edit().putBoolean("running", false).apply()
         super.onDestroy()
     }
 

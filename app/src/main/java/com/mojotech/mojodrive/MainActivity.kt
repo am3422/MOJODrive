@@ -2,6 +2,7 @@ package com.mojotech.mojodrive
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -9,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
@@ -71,7 +73,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.9 • Clustered Confidence Camera Engine"
+            text = "MVP 0.10 • Location-First Curve-Aware Camera Engine"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(12))
@@ -167,13 +169,16 @@ class MainActivity : Activity() {
         addButton("OPEN LOCATION SETTINGS", 48) {
             startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
         }
+        addButton("OPEN BATTERY OPTIMIZATION SETTINGS", 48) {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
 
         root.addView(TextView(this).apply {
             text =
-                "0.9: duplicate cameras are clustered, severe cross-track is a hard reject, " +
-                "confidence changes with distance, confirmed cameras cannot thrash, only one global " +
-                "camera alert sounds at a time, short GPS dropouts are bridged, and raw ACCEL/GYRO " +
-                "rows are no longer saved to CSV."
+                "0.10: camera matching now keeps valid coordinates even when GPS speed accuracy is poor, " +
+                "uses curve-aware hard geometry and directed-road checks, guarantees a first camera alert, " +
+                "bridges confirmed cameras through short GPS loss, auto-recovers stalled GPS callbacks, " +
+                "and logs GNSS health without restoring raw sensor spam."
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(14), 0, 0)
@@ -216,7 +221,7 @@ class MainActivity : Activity() {
                 .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
         )
 
-        Toast.makeText(this, "MOJO Drive 0.9 started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.10 started.", Toast.LENGTH_SHORT).show()
     }
 
     private fun markEvent() {
@@ -248,7 +253,8 @@ class MainActivity : Activity() {
         val tripActive = prefs.getBoolean("trip_active", false)
         val speed = prefs.getFloat("speed_kmh", 0f)
         val accuracy = prefs.getFloat("accuracy_m", -1f)
-        val gpsAge = prefs.getLong("gps_age_ms", -1L)
+        val locationAge = prefs.getLong("gps_age_ms", -1L)
+        val speedAge = prefs.getLong("gps_speed_age_ms", -1L)
         val gpsStale = prefs.getBoolean("gps_stale", true)
         val activeLimit = prefs.getInt("active_limit_kmh", prefs.getInt("threshold_kmh", 80))
 
@@ -264,7 +270,7 @@ class MainActivity : Activity() {
         val cameraLimit = prefs.getInt("camera_limit_kmh", -1)
         val cameraRoad = prefs.getString("camera_road_name", "") ?: ""
         val cameraType = prefs.getString("camera_type", "") ?: ""
-        val roadCross = prefs.getFloat("camera_road_cross_m", -1f)
+        val curveCross = prefs.getFloat("camera_curve_cross_m", -1f)
         val forwardDelta = prefs.getFloat("camera_forward_delta", -1f)
         val level = prefs.getInt("camera_alert_level", 0)
         val warn = prefs.getFloat("camera_warning_distance_m", -1f)
@@ -277,28 +283,57 @@ class MainActivity : Activity() {
                 "CONFIRMED ${if (cameraType == "red_light") "red-light" else "speed"} camera $cameraId" +
                     " • ${cameraDistance.toInt()}m$lim$road • warn ${warn.toInt()}m" +
                     " • L$level${if (ttc > 0f) " • ${ttc.toInt()}s" else ""}" +
-                    " • cross ${roadCross.toInt()}m • fwdΔ ${forwardDelta.toInt()}°"
+                    " • curveCross ${curveCross.toInt()}m • fwdΔ ${forwardDelta.toInt()}°"
             } else {
                 "Confirmed camera: --"
             }
 
+        val sats = prefs.getInt("gnss_satellites", 0)
+        val used = prefs.getInt("gnss_used_in_fix", 0)
         gpsText.text =
             when {
                 !running -> "GPS: stopped"
-                gpsAge < 0 -> "GPS: waiting for valid speed fix"
-                gpsStale -> String.format(Locale.US, "GPS: STALE • %.1f s • acc %.1f m", gpsAge / 1000.0, accuracy)
-                prefs.getBoolean("imu_bridge", false) -> String.format(Locale.US, "GPS: IMU BRIDGE • %.1f s", gpsAge / 1000.0)
-                else -> String.format(Locale.US, "GPS: OK • age %.1f s • acc %.1f m", gpsAge / 1000.0, accuracy)
+                locationAge < 0 -> "GPS: waiting for valid location"
+                gpsStale -> String.format(
+                    Locale.US,
+                    "GPS: STALE • loc %.1fs • speed %.1fs • acc %.1fm • sats %d/%d",
+                    locationAge / 1000.0,
+                    if (speedAge >= 0) speedAge / 1000.0 else -1.0,
+                    accuracy,
+                    used,
+                    sats
+                )
+                prefs.getBoolean("imu_bridge", false) -> String.format(
+                    Locale.US,
+                    "GPS: LOC OK • speed bridge %.1fs • acc %.1fm • sats %d/%d",
+                    if (speedAge >= 0) speedAge / 1000.0 else -1.0,
+                    accuracy,
+                    used,
+                    sats
+                )
+                else -> String.format(
+                    Locale.US,
+                    "GPS: OK • loc %.1fs • speed %.1fs • acc %.1fm • sats %d/%d",
+                    locationAge / 1000.0,
+                    if (speedAge >= 0) speedAge / 1000.0 else -1.0,
+                    accuracy,
+                    used,
+                    sats
+                )
             }
 
         val raw = prefs.getInt("camera_count", 0)
         val clusters = prefs.getInt("camera_cluster_count", 0)
         val confirmed = prefs.getInt("confirmed_camera_count", 0)
         val provider = prefs.getString("provider", "--") ?: "--"
+        val watchdog = prefs.getInt("gps_watchdog_count", 0)
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val batteryUnrestricted = try { powerManager.isIgnoringBatteryOptimizations(packageName) } catch (_: Exception) { false }
+        val batteryState = if (batteryUnrestricted) "battery unrestricted" else "battery optimized"
 
         statusText.text =
             when {
-                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • LIVE LOG"
+                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • GPS recoveries $watchdog • $batteryState • LIVE LOG"
                 tripActive -> "Trip interrupted • persistent log waiting for recovery"
                 else -> "Stopped"
             }

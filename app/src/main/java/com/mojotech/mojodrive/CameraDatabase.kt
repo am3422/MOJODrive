@@ -22,7 +22,7 @@ data class CameraPoint(
 )
 
 class CameraDatabase(private val context: Context) {
-    private val dbFile = File(context.filesDir, "shiraz_cameras_v09.sqlite")
+    private val dbFile = File(context.filesDir, "shiraz_cameras_v10.sqlite")
 
     private fun ensureDatabase() {
         if (dbFile.exists() && dbFile.length() > 0L) return
