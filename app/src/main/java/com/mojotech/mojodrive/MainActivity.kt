@@ -73,7 +73,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.10 • Location-First Curve-Aware Camera Engine"
+            text = "MVP 0.12 • Hybrid Location + Curve-Aware Camera Engine"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(12))
@@ -106,7 +106,7 @@ class MainActivity : Activity() {
         root.addView(cameraText)
 
         gpsText = TextView(this).apply {
-            text = "GPS: waiting"
+            text = "LOCATION: waiting"
             textSize = 16f
             gravity = Gravity.CENTER
         }
@@ -175,10 +175,9 @@ class MainActivity : Activity() {
 
         root.addView(TextView(this).apply {
             text =
-                "0.10: camera matching now keeps valid coordinates even when GPS speed accuracy is poor, " +
-                "uses curve-aware hard geometry and directed-road checks, guarantees a first camera alert, " +
-                "bridges confirmed cameras through short GPS loss, auto-recovers stalled GPS callbacks, " +
-                "and logs GNSS health without restoring raw sensor spam."
+                "0.12: preserves the 0.11 fused/native location pipeline and camera engine, and adds strict speed freshness. " +
+                "A stale speed is never shown as current, long location gaps reset fusion history, and two consecutive " +
+                "near-zero fixes snap speed to 0 so a stopped car cannot keep an old driving speed on screen."
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(14), 0, 0)
@@ -221,7 +220,7 @@ class MainActivity : Activity() {
                 .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
         )
 
-        Toast.makeText(this, "MOJO Drive 0.10 started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.12 started.", Toast.LENGTH_SHORT).show()
     }
 
     private fun markEvent() {
@@ -252,15 +251,20 @@ class MainActivity : Activity() {
         val running = prefs.getBoolean("running", false)
         val tripActive = prefs.getBoolean("trip_active", false)
         val speed = prefs.getFloat("speed_kmh", 0f)
+        val speedDisplayValid = prefs.getBoolean("speed_display_valid", false)
         val accuracy = prefs.getFloat("accuracy_m", -1f)
         val locationAge = prefs.getLong("gps_age_ms", -1L)
         val speedAge = prefs.getLong("gps_speed_age_ms", -1L)
         val gpsStale = prefs.getBoolean("gps_stale", true)
         val activeLimit = prefs.getInt("active_limit_kmh", prefs.getInt("threshold_kmh", 80))
 
-        speedText.text = String.format(Locale.US, "%.0f km/h", speed)
+        speedText.text =
+            if (running && speedDisplayValid) String.format(Locale.US, "%.0f km/h", speed)
+            else if (running) "-- km/h"
+            else "0 km/h"
+
         speedText.setTextColor(
-            if (running && !gpsStale && speed >= activeLimit + 1f) Color.rgb(210, 35, 35)
+            if (running && speedDisplayValid && !gpsStale && speed >= activeLimit + 1f) Color.rgb(210, 35, 35)
             else Color.rgb(20, 91, 210)
         )
         limitText.text = "LIMIT $activeLimit km/h"
@@ -292,20 +296,20 @@ class MainActivity : Activity() {
         val used = prefs.getInt("gnss_used_in_fix", 0)
         gpsText.text =
             when {
-                !running -> "GPS: stopped"
-                locationAge < 0 -> "GPS: waiting for valid location"
+                !running -> "LOCATION: stopped"
+                locationAge < 0 -> "LOCATION: waiting for valid location"
                 gpsStale -> String.format(
                     Locale.US,
-                    "GPS: STALE • loc %.1fs • speed %.1fs • acc %.1fm • sats %d/%d",
+                    "LOCATION: STALE • loc %.1fs • speed %s • acc %.1fm • sats %d/%d",
                     locationAge / 1000.0,
-                    if (speedAge >= 0) speedAge / 1000.0 else -1.0,
+                    if (speedDisplayValid && speedAge >= 0) String.format(Locale.US, "%.1fs", speedAge / 1000.0) else "--",
                     accuracy,
                     used,
                     sats
                 )
                 prefs.getBoolean("imu_bridge", false) -> String.format(
                     Locale.US,
-                    "GPS: LOC OK • speed bridge %.1fs • acc %.1fm • sats %d/%d",
+                    "LOCATION: OK • speed bridge %.1fs • acc %.1fm • sats %d/%d",
                     if (speedAge >= 0) speedAge / 1000.0 else -1.0,
                     accuracy,
                     used,
@@ -313,7 +317,7 @@ class MainActivity : Activity() {
                 )
                 else -> String.format(
                     Locale.US,
-                    "GPS: OK • loc %.1fs • speed %.1fs • acc %.1fm • sats %d/%d",
+                    "LOCATION: OK • loc %.1fs • speed %.1fs • acc %.1fm • sats %d/%d",
                     locationAge / 1000.0,
                     if (speedAge >= 0) speedAge / 1000.0 else -1.0,
                     accuracy,
@@ -326,14 +330,14 @@ class MainActivity : Activity() {
         val clusters = prefs.getInt("camera_cluster_count", 0)
         val confirmed = prefs.getInt("confirmed_camera_count", 0)
         val provider = prefs.getString("provider", "--") ?: "--"
-        val watchdog = prefs.getInt("gps_watchdog_count", 0)
+        val stalls = prefs.getInt("location_stall_count", 0)
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val batteryUnrestricted = try { powerManager.isIgnoringBatteryOptimizations(packageName) } catch (_: Exception) { false }
         val batteryState = if (batteryUnrestricted) "battery unrestricted" else "battery optimized"
 
         statusText.text =
             when {
-                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • GPS recoveries $watchdog • $batteryState • LIVE LOG"
+                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • location stalls $stalls • $batteryState • LIVE LOG"
                 tripActive -> "Trip interrupted • persistent log waiting for recovery"
                 else -> "Stopped"
             }

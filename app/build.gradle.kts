@@ -11,8 +11,8 @@ android {
         applicationId = "com.mojotech.mojodrive"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.10"
+        versionCode = 12
+        versionName = "0.12"
     }
 
     compileOptions {
@@ -23,4 +23,9 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+
+dependencies {
+    implementation("com.google.android.gms:play-services-location:21.3.0")
 }

@@ -20,6 +20,14 @@ import android.net.Uri
 import android.os.*
 import android.provider.MediaStore
 import android.widget.Toast
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import java.io.BufferedWriter
 import java.io.File
 import java.io.OutputStreamWriter
@@ -43,16 +51,21 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         private const val LOCATION_STALE_MS = 8000L
         private const val LOCATION_RECOVERY_RESET_MS = 3000L
         private const val GPS_CAMERA_BRIDGE_START_MS = 1500L
-        private const val GPS_CAMERA_BRIDGE_MAX_MS = 25_000L
-        private const val FUSION_BRIDGE_MS = 15_000L
+        private const val GPS_CAMERA_BRIDGE_MAX_MS = 12_000L
+        private const val FUSION_BRIDGE_MS = 12_000L
+        private const val SPEED_DISPLAY_STALE_MS = 4_000L
+        private const val SPEED_HARD_INVALIDATE_MS = 12_000L
+        private const val STATIONARY_RAW_SPEED_KMH = 2.5f
+        private const val STATIONARY_DERIVED_SPEED_KMH = 3.5f
+        private const val STATIONARY_CONFIRM_HITS = 2
         private const val BEARING_HOLD_MS = 8000L
 
-        private const val GPS_CALLBACK_WATCHDOG_MS = 4000L
-        private const val GPS_WATCHDOG_COOLDOWN_MS = 10_000L
+        private const val LOCATION_FALLBACK_TRIGGER_MS = 6000L
+        private const val LOCATION_STALL_LOG_MS = 30_000L
 
         private const val ROAD_IMPACT_COOLDOWN_MS = 1200L
         private const val ROAD_IMPACT_SHOCK_MPS2 = 3.2f
-        private const val OVERSPEED_REPEAT_MS = 7000L
+        private const val OVERSPEED_REPEAT_MS = 15_000L
 
         private const val CAMERA_SEARCH_M = 2300f
         private const val CAMERA_CONFIRM_EXTRA_M = 500f
@@ -178,6 +191,9 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var fusionActive = false
     private var imuBridgeActive = false
     private var latestSpeedEstimateReliable = false
+    private var speedDisplayValid = false
+    private var stationarySpeedHits = 0
+    private var speedInvalidationLogged = false
 
     private var previousPositionForSpeed: Location? = null
     private var previousPositionElapsedMs = 0L
@@ -212,13 +228,17 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var liveWriter: BufferedWriter? = null
     private var lastLiveFlushElapsed = 0L
 
-    private var locationUpdatesRegistered = false
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private var fusedUpdatesRegistered = false
+    private var legacyLocationUpdatesRegistered = false
+    private var networkFallbackRegistered = false
     private var sensorsRegistered = false
     private var gnssRegistered = false
     private var serviceTrackingActive = false
-    private var lastGpsRequestElapsedMs = 0L
-    private var lastWatchdogReregisterElapsedMs = 0L
-    private var gpsWatchdogCount = 0
+    private var lastLocationRequestElapsedMs = 0L
+    private var lastLocationStallLogElapsedMs = 0L
+    private var locationStallCount = 0
+    private var lastProcessedLocationRealtimeNanos = 0L
 
     @Volatile private var latestLat = Double.NaN
     @Volatile private var latestLon = Double.NaN
@@ -282,7 +302,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private val healthTicker = object : Runnable {
         override fun run() {
             updateLocationHealth()
-            maybeRecoverGpsCallbacks()
+            monitorLocationPipeline()
             maybeLogSensorHealth()
             handler.postDelayed(this, 500L)
         }
@@ -296,6 +316,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
@@ -375,7 +396,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         startForeground(NOTIFICATION_ID, makeNotification("Waiting for valid GPS location…"))
         prefs.edit().putBoolean("running", true).apply()
 
-        requestGpsUpdates("service_start")
+        startLocationPipeline()
         registerGnssStatus()
         startSensorUpdates()
 
@@ -383,7 +404,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             appendMarker(
                 "CAMERA_DB_READY",
                 "raw=${cameras.size};clusters=${cameraClusters.size};" +
-                    "db=shiraz_cameras_v10;engine=location_first_curve_aware_v10"
+                    "db=shiraz_cameras_v11;engine=hybrid_location_curve_aware_v12"
             )
         }
 
@@ -588,7 +609,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         loggingStarted = true
         appendMarker(
             "START",
-            "persistent_live_log=true;camera_engine=location_first_curve_aware_v10;raw_sensor_csv=false"
+            "persistent_live_log=true;camera_engine=hybrid_location_curve_aware_v12;raw_sensor_csv=false"
         )
     }
 
@@ -701,7 +722,15 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         ).show()
     }
 
-    private fun requestGpsUpdates(reason: String) {
+    private val fusedLocationCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            for (location in result.locations) {
+                processLocation(location, "fused:${location.provider ?: "unknown"}")
+            }
+        }
+    }
+
+    private fun startLocationPipeline() {
         if (
             checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
             checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED
@@ -709,31 +738,119 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             return
         }
 
+        lastLocationRequestElapsedMs = SystemClock.elapsedRealtime()
+
+        val playServicesAvailable =
+            GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(this) == ConnectionResult.SUCCESS
+
+        if (playServicesAvailable) {
+            requestFusedLocationUpdates()
+        } else {
+            appendMarker("LOCATION_PRIMARY_UNAVAILABLE", "source=fused;reason=play_services_unavailable")
+            startLegacyLocationFallback("no_play_services")
+        }
+    }
+
+    private fun requestFusedLocationUpdates() {
+        if (fusedUpdatesRegistered) return
+        if (
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED
+        ) return
+
         try {
-            if (locationUpdatesRegistered) {
-                locationManager.removeUpdates(this)
-                locationUpdatesRegistered = false
+            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
+                .setMinUpdateIntervalMillis(500L)
+                .setMaxUpdateDelayMillis(1000L)
+                .setMinUpdateDistanceMeters(0f)
+                .setWaitForAccurateLocation(false)
+                .build()
+
+            fusedLocationClient.requestLocationUpdates(
+                request,
+                fusedLocationCallback,
+                Looper.getMainLooper()
+            ).addOnSuccessListener {
+                fusedUpdatesRegistered = true
+                if (loggingStarted) appendMarker("LOCATION_REQUEST", "source=fused;reason=service_start")
+            }.addOnFailureListener { e ->
+                fusedUpdatesRegistered = false
+                if (loggingStarted) {
+                    appendMarker(
+                        "LOCATION_REQUEST_FAILED",
+                        "source=fused;error=${e.javaClass.simpleName}"
+                    )
+                }
+                startLegacyLocationFallback("fused_request_failed")
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            fusedUpdatesRegistered = false
+            if (loggingStarted) {
+                appendMarker(
+                    "LOCATION_REQUEST_FAILED",
+                    "source=fused;error=${e.javaClass.simpleName}"
+                )
+            }
+            startLegacyLocationFallback("fused_exception")
+        }
+    }
+
+    private fun startLegacyLocationFallback(reason: String) {
+        if (legacyLocationUpdatesRegistered) return
+        if (
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        var registeredAny = false
 
         try {
             if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
-                    500L,
+                    700L,
                     0f,
                     this
                 )
-                locationUpdatesRegistered = true
-                lastGpsRequestElapsedMs = SystemClock.elapsedRealtime()
-                if (loggingStarted) appendMarker("GPS_REQUEST", "reason=$reason")
-            } else if (loggingStarted) {
-                appendMarker("GPS_PROVIDER_DISABLED", "reason=$reason")
+                registeredAny = true
             }
         } catch (e: Exception) {
-            if (loggingStarted) appendMarker("GPS_REQUEST_FAILED", "reason=$reason;error=${e.javaClass.simpleName}")
+            if (loggingStarted) appendMarker(
+                "LOCATION_REQUEST_FAILED",
+                "source=legacy_gps;error=${e.javaClass.simpleName}"
+            )
+        }
+
+        try {
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    1000L,
+                    0f,
+                    this
+                )
+                networkFallbackRegistered = true
+                registeredAny = true
+            }
+        } catch (e: Exception) {
+            if (loggingStarted) appendMarker(
+                "LOCATION_REQUEST_FAILED",
+                "source=legacy_network;error=${e.javaClass.simpleName}"
+            )
+        }
+
+        legacyLocationUpdatesRegistered = registeredAny
+        if (registeredAny && loggingStarted) {
+            appendMarker(
+                "LOCATION_FALLBACK_ENABLED",
+                "reason=$reason;gps=${safeProviderEnabled(LocationManager.GPS_PROVIDER)};" +
+                    "network=${safeProviderEnabled(LocationManager.NETWORK_PROVIDER)}"
+            )
         }
     }
+
+    private fun safeProviderEnabled(provider: String): Boolean =
+        try { locationManager.isProviderEnabled(provider) } catch (_: Exception) { false }
 
     private fun registerGnssStatus() {
         if (gnssRegistered) return
@@ -754,38 +871,56 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         sensorsRegistered = true
     }
 
-    private fun maybeRecoverGpsCallbacks() {
-        if (!serviceTrackingActive || !locationUpdatesRegistered) return
+    private fun monitorLocationPipeline() {
+        if (!serviceTrackingActive) return
         val now = SystemClock.elapsedRealtime()
         val callbackAge = currentGpsCallbackAgeMs()
-        val sinceRequest = now - lastGpsRequestElapsedMs
+        val sinceRequest = now - lastLocationRequestElapsedMs
+
         val stalled =
             if (lastGpsCallbackElapsedMs <= 0L) {
-                sinceRequest >= GPS_CALLBACK_WATCHDOG_MS
+                sinceRequest >= LOCATION_FALLBACK_TRIGGER_MS
             } else {
-                callbackAge >= GPS_CALLBACK_WATCHDOG_MS
+                callbackAge >= LOCATION_FALLBACK_TRIGGER_MS
             }
+
+        if (stalled && !legacyLocationUpdatesRegistered) {
+            startLegacyLocationFallback("primary_stall")
+        }
 
         if (
             stalled &&
-            now - lastWatchdogReregisterElapsedMs >= GPS_WATCHDOG_COOLDOWN_MS
+            now - lastLocationStallLogElapsedMs >= LOCATION_STALL_LOG_MS
         ) {
-            lastWatchdogReregisterElapsedMs = now
-            gpsWatchdogCount++
+            lastLocationStallLogElapsedMs = now
+            locationStallCount++
             appendMarker(
-                "GPS_WATCHDOG_REREGISTER",
-                "callbackAgeMs=$callbackAge;sinceRequestMs=$sinceRequest;count=$gpsWatchdogCount;" +
+                "LOCATION_STALL",
+                "callbackAgeMs=$callbackAge;sinceRequestMs=$sinceRequest;count=$locationStallCount;" +
+                    "fused=$fusedUpdatesRegistered;legacy=$legacyLocationUpdatesRegistered;" +
+                    "gpsEnabled=${safeProviderEnabled(LocationManager.GPS_PROVIDER)};" +
+                    "networkEnabled=${safeProviderEnabled(LocationManager.NETWORK_PROVIDER)};" +
                     "satellites=$gnssSatellites;used=$gnssUsedInFix"
             )
-            requestGpsUpdates("watchdog")
-            registerGnssStatus()
         }
     }
 
     override fun onLocationChanged(location: Location) {
-        if (location.provider != LocationManager.GPS_PROVIDER) return
+        processLocation(location, "legacy:${location.provider ?: "unknown"}")
+    }
 
+    private fun processLocation(location: Location, source: String) {
         val now = SystemClock.elapsedRealtime()
+
+        // Fused and legacy providers can report the same underlying fix. Keep only newer fixes.
+        val realtimeNanos = location.elapsedRealtimeNanos
+        if (realtimeNanos > 0L && realtimeNanos <= lastProcessedLocationRealtimeNanos) {
+            return
+        }
+        if (realtimeNanos > 0L) {
+            lastProcessedLocationRealtimeNanos = realtimeNanos
+        }
+
         val previousCallback = lastGpsCallbackElapsedMs
         lastGpsCallbackElapsedMs = now
 
@@ -795,9 +930,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         val rawLat = location.latitude
         val rawLon = location.longitude
 
+        val isRawGps = location.provider == LocationManager.GPS_PROVIDER
+        val maxLocationAccuracy = if (isRawGps) 50f else 80f
+
         val locationValid =
-            ageMs in 0L..3000L &&
-                (!location.hasAccuracy() || location.accuracy <= 50f) &&
+            ageMs in 0L..5000L &&
+                (!location.hasAccuracy() || location.accuracy <= maxLocationAccuracy) &&
                 rawLat.isFinite() &&
                 rawLon.isFinite() &&
                 rawLat in -90.0..90.0 &&
@@ -805,12 +943,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         if (!locationValid) {
             appendRow(
-                "GPS_LOCATION_REJECTED",
+                "LOCATION_REJECTED",
                 Float.NaN, Float.NaN, Float.NaN, Float.NaN,
                 0L,
                 false,
                 false,
-                "reason=${locationRejectionReason(location, ageMs)};" +
+                "source=$source;reason=${locationRejectionReason(location, ageMs)};" +
                     "rawLat=${String.format(Locale.US, "%.7f", rawLat)};" +
                     "rawLon=${String.format(Locale.US, "%.7f", rawLon)};" +
                     "rawAcc=${String.format(Locale.US, "%.1f", accuracy)};" +
@@ -830,15 +968,33 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             prepareForLocationGapRecovery(locationGap)
         }
 
+        val previousForBearing = previousPositionForSpeed?.let { Location(it) }
+        val previousForBearingTime = previousPositionElapsedMs
+
         latestLat = rawLat
         latestLon = rawLon
-        latestProvider = location.provider ?: "gps"
+        latestProvider = source
         latestAccuracy = accuracy
         latestRawSpeedKmh = rawSpeed
         lastValidLocationElapsedMs = now
         gpsStale = false
 
         latestDerivedSpeedKmh = updateDerivedSpeed(location, now)
+
+        val derivedBearing =
+            if (previousForBearing != null && previousForBearingTime > 0L) {
+                val dt = (now - previousForBearingTime) / 1000f
+                val prevAcc = if (previousForBearing.hasAccuracy()) previousForBearing.accuracy else 50f
+                val curAcc = if (location.hasAccuracy()) location.accuracy else 50f
+                val moved = previousForBearing.distanceTo(location)
+                if (dt in 0.4f..5.0f && prevAcc <= 35f && curAcc <= 35f && moved >= 5f) {
+                    normalizeBearing(previousForBearing.bearingTo(location))
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
 
         val speedAccuracyOk =
             if (Build.VERSION.SDK_INT >= 26 && location.hasSpeedAccuracy()) {
@@ -860,6 +1016,10 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         if (location.hasBearing() && bearingSupportSpeed >= 5f) {
             latestBearing = normalizeBearing(location.bearing)
+            latestBearingValid = true
+            lastBearingElapsedMs = now
+        } else if (derivedBearing != null && bearingSupportSpeed >= 5f) {
+            latestBearing = derivedBearing
             latestBearingValid = true
             lastBearingElapsedMs = now
         } else {
@@ -892,27 +1052,58 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             lastValidSpeedElapsedMs = now
             lastSpeedEstimateElapsedMs = now
             latestSpeedEstimateReliable = true
+            speedDisplayValid = true
+            speedInvalidationLogged = false
         } else if (
             latestDerivedSpeedKmh.isFinite() &&
             latestDerivedSpeedKmh in 0f..250f &&
-            latestAccuracy in 0f..25f
+            latestAccuracy in 0f..40f
         ) {
-            // Keep Camera Engine alive when Android reports poor speed accuracy.
-            // Position-derived speed is deliberately a weak correction, not a replacement
-            // for a good GNSS speed measurement.
             val derivedMps = latestDerivedSpeedKmh / 3.6f
+            val derivedAccuracyMps = if (latestAccuracy <= 20f) 4.5f else 7.0f
             if (!fusionInitialized) {
-                resetFusionWithMeasurement(derivedMps, 4.5f)
+                resetFusionWithMeasurement(derivedMps, derivedAccuracyMps)
             } else {
-                correctFusionWithMeasurement(derivedMps, 4.5f)
+                correctFusionWithMeasurement(derivedMps, derivedAccuracyMps)
             }
             lastSpeedEstimateElapsedMs = now
-            latestSpeedEstimateReliable = latestAccuracy <= 15f
+            latestSpeedEstimateReliable = latestAccuracy <= 30f
+            speedDisplayValid = latestSpeedEstimateReliable
+            if (speedDisplayValid) speedInvalidationLogged = false
         } else {
             latestSpeedEstimateReliable = currentSpeedEstimateAgeMs() in 0L..3000L
+            speedDisplayValid = latestSpeedEstimateReliable
         }
 
-        if (fusionInitialized) {
+        // Strong stationary evidence must win over a slowly-decaying fusion estimate.
+        // Two consecutive near-zero speed fixes are enough to snap the UI/fusion to 0.
+        val rawStationary = speedValid && rawSpeed <= STATIONARY_RAW_SPEED_KMH
+        val derivedStationary =
+            !speedValid &&
+                latestDerivedSpeedKmh.isFinite() &&
+                latestDerivedSpeedKmh <= STATIONARY_DERIVED_SPEED_KMH &&
+                latestAccuracy in 0f..15f
+
+        if (rawStationary || derivedStationary) {
+            stationarySpeedHits = min(STATIONARY_CONFIRM_HITS, stationarySpeedHits + 1)
+        } else if (
+            (speedValid && rawSpeed >= 5f) ||
+            (latestDerivedSpeedKmh.isFinite() && latestDerivedSpeedKmh >= 6f)
+        ) {
+            stationarySpeedHits = 0
+        }
+
+        if (stationarySpeedHits >= STATIONARY_CONFIRM_HITS) {
+            fusionSpeedMps = 0f
+            fusionVariance = 0.5f
+            fusionInitialized = true
+            latestSpeedKmh = 0f
+            latestSpeedEstimateReliable = true
+            speedDisplayValid = true
+            lastSpeedEstimateElapsedMs = now
+            imuBridgeActive = false
+            overspeedActive = false
+        } else if (fusionInitialized) {
             latestSpeedKmh = (fusionSpeedMps * 3.6f).coerceIn(0f, 250f)
         } else if (latestDerivedSpeedKmh.isFinite()) {
             latestSpeedKmh = latestDerivedSpeedKmh.coerceIn(0f, 250f)
@@ -920,23 +1111,26 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             latestSpeedKmh = rawSpeed.coerceIn(0f, 250f)
         }
 
-        imuBridgeActive = !speedValid && currentSpeedEstimateAgeMs() in 0L..FUSION_BRIDGE_MS
+        imuBridgeActive =
+            stationarySpeedHits < STATIONARY_CONFIRM_HITS &&
+                !speedValid &&
+                currentSpeedEstimateAgeMs() in 0L..FUSION_BRIDGE_MS
 
         evaluateAllCameras()
         if (latestSpeedEstimateReliable) handleOverspeed(latestSpeedKmh)
 
         val speedReason = if (speedValid) "OK" else speedRejectionReason(location, speedAccuracyOk)
         appendRow(
-            if (speedValid) "GPS" else "GPS_LOCATION_ONLY",
+            if (speedValid) "LOCATION" else "LOCATION_ONLY",
             Float.NaN, Float.NaN, Float.NaN, Float.NaN,
             0L,
             true,
             speedValid,
-            "speedReason=$speedReason;" +
+            "source=$source;speedReason=$speedReason;" +
                 "derived=${if (latestDerivedSpeedKmh.isFinite()) String.format(Locale.US, "%.2f", latestDerivedSpeedKmh) else ""};" +
                 "locationGapMs=$locationGap;" +
                 "callbackGapMs=${if (previousCallback > 0L) now - previousCallback else -1L};" +
-                "fusion=${if (fusionActive) "GPS_IMU" else "GPS_OR_POSITION"}",
+                "fusion=${if (fusionActive) "GPS_IMU" else "POSITION_OR_SPEED"}",
             null
         )
 
@@ -988,14 +1182,14 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         if (previous == null || previousTime <= 0L) return Float.NaN
         val dt = (now - previousTime) / 1000f
-        if (dt !in 0.4f..3.5f) {
+        if (dt !in 0.4f..5.0f) {
             derivedSpeedSamples.clear()
             return Float.NaN
         }
 
         val prevAcc = if (previous.hasAccuracy()) previous.accuracy else 25f
         val curAcc = if (location.hasAccuracy()) location.accuracy else 25f
-        if (prevAcc > 25f || curAcc > 25f) return Float.NaN
+        if (prevAcc > 40f || curAcc > 40f) return Float.NaN
 
         val kmh = previous.distanceTo(location) / dt * 3.6f
         if (kmh !in 0f..250f) return Float.NaN
@@ -1032,6 +1226,26 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         derivedSpeedSamples.clear()
         previousPositionForSpeed = null
         previousPositionElapsedMs = 0L
+
+        // Never carry a pre-gap speed estimate into a recovered location. The old 0.10
+        // behavior could keep 50-90 km/h on screen long after the car had stopped.
+        fusionInitialized = false
+        fusionActive = false
+        fusionSpeedMps = 0f
+        fusionVariance = 4f
+        lastFusionSensorNs = 0L
+        latestGpsFilteredKmh = Float.NaN
+        latestDerivedSpeedKmh = Float.NaN
+        latestSpeedKmh = 0f
+        latestForwardAccelMps2 = 0f
+        latestSpeedEstimateReliable = false
+        speedDisplayValid = false
+        imuBridgeActive = false
+        stationarySpeedHits = 0
+        overspeedActive = false
+        lastValidSpeedElapsedMs = 0L
+        lastSpeedEstimateElapsedMs = 0L
+        speedInvalidationLogged = false
 
         for ((_, state) in cameraStates) {
             state.lastDistanceM = Float.MAX_VALUE
@@ -1124,13 +1338,54 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         }
 
         val estimateAge = currentSpeedEstimateAgeMs()
+
+        // UI must never present an old numeric speed as if it were current. Keep the
+        // internal estimate for a short bridge, but mark display speed invalid after 4 s.
+        val displayFresh =
+            !gpsStale &&
+                estimateAge in 0L..SPEED_DISPLAY_STALE_MS &&
+                latestSpeedEstimateReliable
+
+        speedDisplayValid = displayFresh
+
         imuBridgeActive =
             fusionActive &&
                 estimateAge in 1201..FUSION_BRIDGE_MS &&
-                latestSpeedKmh >= 5f
+                latestSpeedKmh >= 5f &&
+                stationarySpeedHits < STATIONARY_CONFIRM_HITS
+
+        if (
+            (locationAge > SPEED_HARD_INVALIDATE_MS || estimateAge > SPEED_HARD_INVALIDATE_MS) &&
+            (latestSpeedKmh > 0f || fusionInitialized)
+        ) {
+            if (!speedInvalidationLogged && loggingStarted) {
+                appendMarker(
+                    "SPEED_ESTIMATE_INVALIDATED",
+                    "locationAgeMs=$locationAge;estimateAgeMs=$estimateAge;lastSpeed=${String.format(Locale.US, "%.1f", latestSpeedKmh)}"
+                )
+                speedInvalidationLogged = true
+            }
+            latestSpeedKmh = 0f
+            latestSpeedEstimateReliable = false
+            speedDisplayValid = false
+            imuBridgeActive = false
+            fusionInitialized = false
+            fusionActive = false
+            fusionSpeedMps = 0f
+            latestForwardAccelMps2 = 0f
+            overspeedActive = false
+            stationarySpeedHits = 0
+        }
 
         if (locationAge in GPS_CAMERA_BRIDGE_START_MS..GPS_CAMERA_BRIDGE_MAX_MS) {
             bridgeConfirmedCameraAlerts(locationAge)
+        } else if (locationAge > GPS_CAMERA_BRIDGE_MAX_MS) {
+            // Never leave a stale camera/limit on screen for minutes. This also prevents
+            // a later generic speed beep from looking like a late camera alert.
+            if (activeCameraId.isNotEmpty()) {
+                clearUiCamera()
+                cameraAlertZoneActive = false
+            }
         }
 
         if (
@@ -1729,10 +1984,10 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private fun alertRepeatIntervalMs(level: Int): Long =
         when (level) {
-            1 -> 3000L
-            2 -> 1800L
-            3 -> 900L
-            4 -> 450L
+            1 -> 5000L
+            2 -> 3000L
+            3 -> 1500L
+            4 -> 900L
             else -> Long.MAX_VALUE
         }
 
@@ -2067,7 +2322,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
     private fun overspeedAlert() {
         val toneOk = try {
-            toneHigh?.startTone(ToneGenerator.TONE_PROP_BEEP2, 500) ?: false
+            toneLow?.startTone(ToneGenerator.TONE_PROP_ACK, 110) ?: false
         } catch (_: Exception) {
             false
         }
@@ -2079,8 +2334,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         if (hasVibrator) {
             try {
                 vibratePattern(
-                    longArrayOf(0, 300, 100, 300),
-                    intArrayOf(0, 255, 0, 255)
+                    longArrayOf(0, 65),
+                    intArrayOf(0, 90)
                 )
                 vibrationDispatched = true
             } catch (_: Exception) {}
@@ -2095,7 +2350,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
 
         appendMarker(
             "OVERSPEED_OUTPUT",
-            "tone_start_ok=$toneOk;vibrator_present=$hasVibrator;" +
+            "alert_kind=OVERSPEED_SOFT;tone_start_ok=$toneOk;vibrator_present=$hasVibrator;" +
                 "vibration_dispatched=$vibrationDispatched;alarm_volume=$alarmVolume;alarm_max=$alarmMax"
         )
     }
@@ -2173,6 +2428,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 val now = SystemClock.elapsedRealtime()
 
                 if (
+                    speedDisplayValid &&
                     latestSpeedKmh >= 8f &&
                     shock >= ROAD_IMPACT_SHOCK_MPS2 &&
                     now - lastRoadImpactElapsed >= ROAD_IMPACT_COOLDOWN_MS
@@ -2233,7 +2489,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 "rawSensorCsv=false;locationAgeMs=${currentGpsAgeMs()};" +
                 "speedAgeMs=${currentGpsSpeedAgeMs()};callbackAgeMs=${currentGpsCallbackAgeMs()};" +
                 "satellites=$gnssSatellites;used=$gnssUsedInFix;gnssStatusAgeMs=$gnssStatusAge;" +
-                "watchdogCount=$gpsWatchdogCount"
+                "provider=$latestProvider;fused=$fusedUpdatesRegistered;legacy=$legacyLocationUpdatesRegistered;" +
+                "stallCount=$locationStallCount"
         )
 
         accelProcessedCount = 0
@@ -2410,6 +2667,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         prefs.edit()
             .putBoolean("running", serviceTrackingActive)
             .putFloat("speed_kmh", latestSpeedKmh)
+            .putBoolean("speed_display_valid", speedDisplayValid)
             .putFloat("raw_speed_kmh", if (latestRawSpeedKmh.isNaN()) -1f else latestRawSpeedKmh)
             .putFloat("gps_filtered_kmh", if (latestGpsFilteredKmh.isNaN()) -1f else latestGpsFilteredKmh)
             .putFloat("derived_speed_kmh", if (latestDerivedSpeedKmh.isNaN()) -1f else latestDerivedSpeedKmh)
@@ -2432,7 +2690,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             .putBoolean("gps_stale", gpsStale)
             .putInt("gnss_satellites", gnssSatellites)
             .putInt("gnss_used_in_fix", gnssUsedInFix)
-            .putInt("gps_watchdog_count", gpsWatchdogCount)
+            .putInt("location_stall_count", locationStallCount)
             .putInt("active_limit_kmh", activeLimitKmh)
             .putString("camera_id", activeCameraId)
             .putString("camera_type", activeCameraType)
@@ -2464,14 +2722,11 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             else -> ""
         }
 
-        val text = String.format(
-            Locale.US,
-            "%.0f km/h • limit %d%s%s",
-            latestSpeedKmh,
-            activeLimitKmh,
-            cameraPart,
-            gpsPart
-        )
+        val speedPart =
+            if (speedDisplayValid) String.format(Locale.US, "%.0f km/h", latestSpeedKmh)
+            else "-- km/h"
+
+        val text = "$speedPart • limit $activeLimitKmh$cameraPart$gpsPart"
 
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, makeNotification(text))
@@ -2512,7 +2767,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     override fun onProviderEnabled(provider: String) {
         if (provider == LocationManager.GPS_PROVIDER && serviceTrackingActive) {
             appendMarker("GPS_PROVIDER_ENABLED")
-            requestGpsUpdates("provider_enabled")
+            startLegacyLocationFallback("provider_enabled")
         }
     }
 
@@ -2545,8 +2800,16 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         handler.removeCallbacks(healthTicker)
 
         try {
+            if (fusedUpdatesRegistered) {
+                fusedLocationClient.removeLocationUpdates(fusedLocationCallback)
+                fusedUpdatesRegistered = false
+            }
+        } catch (_: Exception) {}
+
+        try {
             locationManager.removeUpdates(this)
-            locationUpdatesRegistered = false
+            legacyLocationUpdatesRegistered = false
+            networkFallbackRegistered = false
         } catch (_: Exception) {}
 
         if (gnssRegistered) {

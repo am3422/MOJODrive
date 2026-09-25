@@ -1,0 +1,66 @@
+MOJO Drive MVP 0.12
+==================
+
+Development rule for this build
+-------------------------------
+0.12 is deliberately a minimal regression-safe patch on top of 0.11.
+It preserves the 0.11 fused high-accuracy location pipeline, additive native GPS/network fallback,
+non-destructive location watchdog, 0.10-derived curve-aware camera matcher, direction gates,
+clustering, sticky camera state, guaranteed first camera alert, compact logging, and short camera bridge.
+
+Only the speed freshness / stale-speed path is changed materially.
+
+Why this patch exists
+---------------------
+The 0.10 field logs proved that when location callbacks stopped, the service and sensors could remain alive
+while the UI kept the last fused speed for many minutes. Example: the second 0.10 test ended with location age
+around 1.95 million ms while the stored fused speed still showed about 50.4 km/h.
+
+0.12 fixes that without redesigning the working camera engine.
+
+Speed fixes in 0.12
+-------------------
+1. UI speed has an explicit validity flag.
+   - Fresh/reliable speed: show the numeric value.
+   - Speed estimate older than 4 s: show "-- km/h", never an old number as current speed.
+
+2. Hard stale-speed invalidation after 12 s.
+   - Internal bridge speed may live briefly for confirmed-camera dead reckoning.
+   - After the bridge window, stale fusion is zeroed and invalidated.
+   - Overspeed state is cleared.
+
+3. Stationary snap-to-zero.
+   - Two consecutive reliable near-zero speed fixes reset fusion to 0 km/h.
+   - This prevents a stopped car from showing a slowly decaying driving speed.
+
+4. Long location-gap recovery resets speed history.
+   - Clears GPS median history, position-derived speed history, fusion state, old acceleration,
+     stale speed ages, stationary state, and overspeed state before using recovered location data.
+   - A pre-gap 50-90 km/h estimate can no longer leak into the recovered session.
+
+5. Road-impact detection no longer uses an invalid/stale displayed speed.
+
+6. Notification follows the same speed-validity rule as the main screen.
+   - Invalid/stale speed is shown as "-- km/h".
+
+Preserved from 0.11
+-------------------
+- Fused high-accuracy location as primary source.
+- Native GPS + network as additive fallback after a fused-location stall.
+- No repeated remove/re-register GPS watchdog loop.
+- LOCATION_STALL diagnostics only.
+- Good location remains usable even when Android speed accuracy is poor.
+- Position-derived speed/bearing fallback.
+- 12 s bridge only for already-confirmed cameras.
+- Curve-aware/direction-aware camera matching remains unchanged.
+- Duplicate clustering, sticky states, and first-alert guarantee remain unchanged.
+- Raw ACCEL/GYRO rows remain excluded from CSV; sensor processing remains ~50 Hz.
+- Generic overspeed sound remains distinct from camera alerts.
+
+Expected road-test behavior
+---------------------------
+- While moving with fresh speed, the speed display updates normally.
+- When stopping, it should reach 0 quickly after two reliable near-zero fixes.
+- If location/speed data disappears, the numeric speed may bridge briefly, then changes to "-- km/h";
+  it must not freeze at the last driving speed for minutes.
+- Camera behavior should match 0.11 because camera geometry/thresholds were intentionally not retuned here.
