@@ -1,0 +1,97 @@
+MOJO Drive MVP 0.13 — Stable Engine Guard + Replay Harness + Road Geometry Shadow
+=================================================================================
+
+BASELINE POLICY
+---------------
+0.13 is built directly on the field-validated 0.12 FULL FIXED baseline.
+The proven driving engine is intentionally NOT retuned.
+
+Locked behavior preserved from 0.12:
+- Fused high-accuracy location + additive native fallback
+- Non-destructive location stall handling
+- Speed freshness, stale-speed invalidation and stop snap-to-zero
+- Camera clustering and sticky state
+- Curve-aware hard geometry
+- Directed-road gate / opposite-direction suppression
+- Confirmation thresholds and hit counts
+- Adaptive warning distance
+- First audible alert guarantee
+- Alert levels and repeat cadence
+- Short confirmed-camera bridge
+- Overspeed behavior and compact logs
+
+1) BASELINE GUARD
+-----------------
+tools/baseline_guard.py protects the field-validated 0.12 engine.
+It hashes 29 critical functions and checks 22 critical constants.
+GitHub Actions now fails before building if any of those stable sections changed accidentally.
+
+2) TRUE REPLAY HARNESS
+----------------------
+tools/replay_harness.py replays the v0.12 camera matcher from recorded LOCATION rows using:
+- recorded fused speed
+- recorded bearing
+- recorded accuracy
+- location-gap information
+- the exact bundled camera database
+
+Three compact golden field fixtures are included.
+Current self-test result:
+  2026-09-26 12:11 trip: 21/21 first-warning sequence exact
+  2026-09-26 16:38 trip:  6/6 first-warning sequence exact
+  2026-09-27 00:24 trip: 11/11 first-warning sequence exact
+  TOTAL: 38/38 exact first-warning encounters reproduced
+
+Run manually:
+  python3 tools/replay_harness.py --self-test
+  python3 tools/replay_harness.py /path/to/MOJODrive_Trip.csv
+
+3) ROAD-GEOMETRY DB — SHADOW ONLY
+---------------------------------
+New asset: app/src/main/assets/road_geometry.sqlite
+Schema v1 contains field-learned road polylines from the three successful v0.12 drives.
+Coverage in this first DB:
+- 30 camera/direction records
+- 293 simplified centerline points
+- only passes that came <=160 m from a camera were accepted as learning data
+- abandoned branches were not trusted as road geometry
+
+New Android helper: RoadGeometryShadow.kt
+At camera diagnostic/warning/pass events it calculates:
+- nearest learned-road corridor distance
+- vehicle heading delta relative to learned road
+- support / weak_support / uncertain / conflict verdict
+
+CRITICAL SAFETY RULE:
+Road geometry is SHADOW ONLY in 0.13.
+It is appended to logs but cannot confirm, reject, delay, suppress, or create an alert.
+The real camera decision remains the exact 0.12 engine.
+This is deliberate: tomorrow's field drive validates Road Geometry before we ever allow it to influence alerts.
+
+New startup log:
+  ROAD_GEOMETRY_SHADOW_READY
+  mode=shadow_only;engine_effect=false
+
+Camera-event details may include:
+  roadGeom=available
+  roadGeomCamera=...
+  roadGeomDistanceM=...
+  roadGeomHeadingDelta=...
+  roadGeomVerdict=support|weak_support|uncertain|conflict
+or:
+  roadGeom=none
+
+4) ROAD-GEOMETRY BUILDER
+------------------------
+tools/build_road_geometry_db.py rebuilds the shadow DB from camera DB + field logs.
+The included compact golden LOCATION fixtures are sufficient to reproduce the current 30-camera DB.
+
+TOMORROW ROAD TEST
+------------------
+Drive normally exactly as with 0.12. Do not change testing behavior for 0.13.
+After the drive send the CSV log.
+We will evaluate two independent layers:
+A) Stable baseline: did 0.12 behavior remain unchanged in real driving?
+B) Shadow geometry: when it had coverage, did it support real same-road passes and conflict with branch/false candidates?
+
+Only after shadow evidence is strong will Road Geometry be allowed to influence the live matcher in a later version.

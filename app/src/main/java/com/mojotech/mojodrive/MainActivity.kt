@@ -73,7 +73,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.12 • Hybrid Location + Curve-Aware Camera Engine"
+            text = "MVP 0.13 • Stable 0.12 Engine + Replay Guard + Road Geometry Shadow"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(12))
@@ -175,9 +175,9 @@ class MainActivity : Activity() {
 
         root.addView(TextView(this).apply {
             text =
-                "0.12: preserves the 0.11 fused/native location pipeline and camera engine, and adds strict speed freshness. " +
-                "A stale speed is never shown as current, long location gaps reset fusion history, and two consecutive " +
-                "near-zero fixes snap speed to 0 so a stopped car cannot keep an old driving speed on screen."
+                "0.13 keeps the proven 0.12 location, speed, camera matching and alert engine locked. " +
+                "Replay regression guards run before every build. Road geometry is collected in SHADOW mode only, " +
+                "so tomorrow's drive can validate it without changing a single camera decision."
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(14), 0, 0)
@@ -220,7 +220,7 @@ class MainActivity : Activity() {
                 .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
         )
 
-        Toast.makeText(this, "MOJO Drive 0.12 started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.13 started.", Toast.LENGTH_SHORT).show()
     }
 
     private fun markEvent() {
@@ -331,13 +331,14 @@ class MainActivity : Activity() {
         val confirmed = prefs.getInt("confirmed_camera_count", 0)
         val provider = prefs.getString("provider", "--") ?: "--"
         val stalls = prefs.getInt("location_stall_count", 0)
+        val roadGeometryCameras = prefs.getInt("road_geometry_cameras", 0)
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val batteryUnrestricted = try { powerManager.isIgnoringBatteryOptimizations(packageName) } catch (_: Exception) { false }
         val batteryState = if (batteryUnrestricted) "battery unrestricted" else "battery optimized"
 
         statusText.text =
             when {
-                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • location stalls $stalls • $batteryState • LIVE LOG"
+                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • roadGeom $roadGeometryCameras shadow • location stalls $stalls • $batteryState • LIVE LOG"
                 tripActive -> "Trip interrupted • persistent log waiting for recovery"
                 else -> "Stopped"
             }

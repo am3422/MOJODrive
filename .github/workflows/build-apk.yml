@@ -26,11 +26,17 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
+      - name: Guard stable v0.12 engine
+        run: python3 tools/baseline_guard.py
+
+      - name: Replay golden v0.12 trips
+        run: python3 tools/replay_harness.py --self-test
+
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MOJODrive-MVP-0.12-debug
+          name: MOJODrive-MVP-0.13-debug
           path: app/build/outputs/apk/debug/app-debug.apk

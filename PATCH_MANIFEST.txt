@@ -1,0 +1,31 @@
+MOJO Drive MVP 0.13 FULL PATCH MANIFEST
+
+Parent baseline: MVP 0.12 FULL FIXED / commit bcbea01543c29d8c5b4b72f40093a3498bd298d6
+Camera decision engine: LOCKED v0.12 behavior
+Road geometry mode: SHADOW ONLY (engine_effect=false)
+
+Validation performed before packaging:
+- baseline_guard.py: PASS (29 functions + 22 constants unchanged)
+- replay_harness.py --self-test: PASS (38/38 first-warning encounters exact sequence)
+- road_geometry.sqlite integrity_check: ok
+- shiraz_cameras.sqlite integrity_check: ok
+- RoadGeometryShadow.kt standalone Kotlin syntax compile: PASS
+
+Key DB facts:
+- camera DB: 267 cameras
+- road geometry: 30 covered cameras, 30 segments, 293 points
+
+SHA-256:
+332ac7dfa3387656d8f259053c3bc9260181f7cbe4e62480eb7f7ae6819c8bfb  app/src/main/java/com/mojotech/mojodrive/LocationService.kt
+103586f0c2ce7843ed414d45b43d107c2ae7b420a5113029ce5a1b64be982659  app/src/main/java/com/mojotech/mojodrive/RoadGeometryShadow.kt
+c474d9cca6734b93609960a70d9cdd84f59b232c402d0dcc2e86e24559a45918  app/src/main/java/com/mojotech/mojodrive/MainActivity.kt
+de201054b944387fd67f812b9d5a103cece70026177a2cc7b0da9d720a69d8ee  app/src/main/java/com/mojotech/mojodrive/CameraDatabase.kt
+23df223faf7baccd84e4a7111746103d104a75eac7789bdec34df8a67bc79087  app/src/main/assets/shiraz_cameras.sqlite
+4a315553ab448edfbb3a16ad8588b7e627a4935472ffc06fad9b6fd4a22e0a85  app/src/main/assets/road_geometry.sqlite
+8e3a308d68ffbdd9c071c6653de68b4c8315edf1810e62f67981f610c1d4d80a  app/build.gradle.kts
+3ae6418dd8d326e230f13052e0a693b68a88c347bd96356e0b5d833c0dd18305  .github/workflows/build-apk.yml
+fa078c27c9e4bde28a029d673875b028884505efa436b68cf60e1ac0be5b679b  gradle.properties
+21fb363f027fc1b9d1dabd7fde4e39ba14b61e4d46d4f547f9c5ced2914524f9  tools/baseline_guard.py
+0f98aa26e5f748d715db87f14ad245dce25b9b89e84746b537756f86fdac4cf9  tools/replay_harness.py
+f6e89926c4293a686b20b3626a4989c7af375590adf8ca18cde4e62978914e4f  tools/build_road_geometry_db.py
+e5621a2b13d04c6a2de9c71d1d5dbc46836a1f2453703b0ce4638569f7f77fa8  tools/golden_v012_replay.json

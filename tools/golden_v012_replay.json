@@ -1,0 +1,20 @@
+{
+  "baseline": "MOJO Drive MVP 0.12 FULL FIXED",
+  "commit": "bcbea01543c29d8c5b4b72f40093a3498bd298d6",
+  "camera_db_sha256": "23df223faf7baccd84e4a7111746103d104a75eac7789bdec34df8a67bc79087",
+  "trips": {
+    "v012_trip_20260926_121128_locations.csv": [
+      "speed:10397+12503", "speed:10546", "speed:9871", "speed:12512", "speed:12283",
+      "speed:13199", "speed:13696", "speed:13792", "speed:13895", "speed:13941",
+      "speed:14195", "speed:14270", "speed:14302", "speed:14427", "speed:14293",
+      "speed:13616", "speed:13675", "speed:14044", "speed:14225", "speed:14516", "speed:14407"
+    ],
+    "v012_trip_20260926_163828_locations.csv": [
+      "speed:13687", "speed:13687", "speed:13572", "speed:13280", "speed:14427", "speed:14524"
+    ],
+    "v012_trip_20260927_002406_locations.csv": [
+      "speed:14646", "speed:14886", "speed:8499", "speed:14396", "speed:13863",
+      "speed:13401", "speed:12371", "speed:12520", "speed:9837", "speed:10533", "speed:12571"
+    ]
+  }
+}

@@ -175,6 +175,9 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var cameraClusters: List<CameraCluster> = emptyList()
     private val cameraStates = HashMap<String, CameraTrackState>()
 
+    // v0.13 diagnostic-only road geometry. It never changes camera decisions.
+    private var roadGeometryShadow: RoadGeometryShadow? = null
+
     private val handler = Handler(Looper.getMainLooper())
     private val speedSamples = ArrayDeque<Float>()
     private val derivedSpeedSamples = ArrayDeque<Float>()
@@ -335,6 +338,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             cameraClusters = emptyList()
         }
 
+        roadGeometryShadow = try {
+            RoadGeometryShadow(this)
+        } catch (_: Exception) {
+            null
+        }
+
         prefs.edit()
             .putBoolean("accel_available", accelerometer != null)
             .putBoolean("gyro_available", gyroscope != null)
@@ -342,6 +351,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             .putBoolean("rotation_vector_available", rotationVector != null)
             .putInt("camera_count", cameras.size)
             .putInt("camera_cluster_count", cameraClusters.size)
+            .putInt("road_geometry_segments", roadGeometryShadow?.segmentCount ?: 0)
+            .putInt("road_geometry_cameras", roadGeometryShadow?.coveredCameraCount ?: 0)
             .apply()
 
         createNotificationChannel()
@@ -405,6 +416,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 "CAMERA_DB_READY",
                 "raw=${cameras.size};clusters=${cameraClusters.size};" +
                     "db=shiraz_cameras_v11;engine=hybrid_location_curve_aware_v12"
+            )
+            appendMarker(
+                "ROAD_GEOMETRY_SHADOW_READY",
+                "segments=${roadGeometryShadow?.segmentCount ?: 0};" +
+                    "coveredCameras=${roadGeometryShadow?.coveredCameraCount ?: 0};" +
+                    "mode=shadow_only;engine_effect=false"
             )
         }
 
@@ -2254,6 +2271,21 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         state: CameraTrackState,
         extra: String
     ) {
+        // Shadow-only: append learned road-corridor evidence to logs without changing
+        // match score, confirmation, warning distance, alert level, or dispatch.
+        val roadShadow = try {
+            roadGeometryShadow?.evaluate(
+                geometry.cluster.memberIds,
+                geometry.cluster.camera.type,
+                latestLat,
+                latestLon,
+                if (latestBearingValid) latestBearing else null
+            )
+        } catch (_: Exception) {
+            null
+        }
+        val roadShadowFields = roadShadow?.toLogFields() ?: "roadGeom=none"
+
         appendRow(
             event,
             Float.NaN, Float.NaN, Float.NaN, Float.NaN,
@@ -2278,7 +2310,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 "approachRate=${String.format(Locale.US, "%.1f", geometry.approachRateMps)};" +
                 "score=${geometry.matchScore};requiredScore=${geometry.requiredScore};" +
                 "requiredHits=${geometry.requiredHits};phase=${state.phase};warned=${state.warned};" +
-                extra,
+                roadShadowFields + ";" + extra,
             geometry
         )
     }
