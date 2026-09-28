@@ -29,8 +29,11 @@ jobs:
       - name: Guard stable v0.12 engine
         run: python3 tools/baseline_guard.py
 
-      - name: Replay golden v0.12 trips
+      - name: Replay golden stable trips
         run: python3 tools/replay_harness.py --self-test
+
+      - name: Validate conservative road geometry shadow
+        run: python3 tools/road_geometry_shadow_test.py
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
@@ -38,5 +41,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MOJODrive-MVP-0.13-debug
+          name: MOJODrive-MVP-0.14-debug
           path: app/build/outputs/apk/debug/app-debug.apk

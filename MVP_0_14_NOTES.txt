@@ -1,0 +1,123 @@
+MOJO Drive MVP 0.14 — Conservative Multi-Approach Road Geometry Shadow
+======================================================================
+
+BASELINE POLICY
+---------------
+0.14 is intentionally NOT a camera-engine retune.
+The field-validated 0.12 runtime remains the locked production decision engine.
+The successful 0.13 field trip is added to regression/replay coverage, but Road Geometry
+still has ZERO authority over live alerts.
+
+Locked behavior preserved:
+- Fused high-accuracy location + additive native fallback
+- Non-destructive location stall handling
+- Speed freshness, stale-speed invalidation and stop snap-to-zero
+- Camera clustering / sticky track state
+- Curve-aware hard geometry
+- Directed-road gate and opposite-direction suppression
+- Confirmation scores / hit counts
+- Adaptive warning distance
+- First audible alert guarantee
+- Alert levels / repeat cadence
+- Confirmed-camera short GPS bridge
+- Overspeed behavior
+- Compact persistent logs
+
+1) FIELD RESULT THAT DROVE 0.14
+--------------------------------
+The 0.13 shadow test confirmed the stable engine again, but exposed one important Road
+Geometry problem: real camera 14302 was correctly warned by the stable engine while the
+first shadow policy reported conflict because its learned polyline was incomplete/far away.
+
+That result is the reason 0.14 stays SHADOW ONLY.
+No geometry result can confirm, reject, suppress, delay or create a camera alert.
+
+2) CONSERVATIVE SHADOW POLICY V2
+---------------------------------
+RoadGeometryShadow now uses policy:
+  conservative_multi_approach_v2
+
+Key changes:
+- Multiple field-proven approaches can coexist for the same physical camera.
+- A support/weak-support candidate wins over a different conflicting learned approach.
+- Far from learned geometry is now outside_coverage, NOT conflict.
+- conflict is emitted only when the car is close to learned geometry AND heading strongly
+  disagrees with the usable learned route.
+- A gray zone remains uncertain instead of forcing a positive/negative conclusion.
+- Logs include policy, selected segment ID, number of segments considered and number of
+  segments currently in coverage.
+- roadGeomEngineEffect=false is explicitly logged.
+
+Current thresholds are diagnostic only:
+  support          <= 70 m corridor and <= 50 deg heading delta
+  weak_support     <= 160 m corridor and <= 65 deg heading delta
+  conflict         <= 180 m coverage and >= 105 deg heading delta
+  uncertain        in coverage but not strong enough either way
+  outside_coverage > 180 m from all learned geometry
+  position_only    geometry nearby but no usable vehicle bearing
+
+3) ROAD-GEOMETRY DATABASE V2
+-----------------------------
+road_geometry.sqlite was rebuilt from four successful field traces:
+- 2026-09-26 12:11
+- 2026-09-26 16:38
+- 2026-09-27 00:24
+- 2026-09-27 10:37 (0.13 shadow trip)
+
+The builder still accepts learning data only from same-direction passes that come within
+160 m of the camera and have enough route span. Abandoned branches are not learned.
+
+Current DB:
+- 30 covered cameras
+- 42 distinct proven approach segments
+- 411 simplified geometry points
+- multiple approaches retained where field traces prove different curves/merges
+- schema metadata version 2
+- source_kind=field_learned_stable_v014
+- engine_effect=false
+
+Important examples from the 0.13 field drive now protected by regression tests:
+- 14302 real first warning: MUST NOT be conflict
+- 14302 real near pass: support/weak_support
+- 14427 false branch: outside coverage initially, then conflict once close to learned route
+  with strongly wrong heading
+- 14427 later real approach: support/weak_support
+- 14293 real approach: support/weak_support
+
+4) REPLAY REGRESSION EXPANDED
+------------------------------
+The exact camera-decision replay suite now includes the successful 0.13 drive as a fourth
+fixture while still replaying the locked v0.12 engine.
+
+Expected exact first-warning sequence:
+- 2026-09-26 12:11: 21
+- 2026-09-26 16:38:  6
+- 2026-09-27 00:24: 11
+- 2026-09-27 10:37: 19
+TOTAL: 57/57 exact first-warning encounters
+
+5) NEW CI GUARD FOR ROAD GEOMETRY
+----------------------------------
+GitHub Actions now runs, in this order:
+1. Stable v0.12 engine hash/constant guard
+2. Four-trip camera replay regression
+3. Conservative Road Geometry shadow regression cases
+4. Android debug APK build
+5. APK artifact upload
+
+A shadow-policy mistake can therefore fail CI before the APK is produced, without touching
+the production camera engine.
+
+6) TONIGHT'S ROAD TEST
+-----------------------
+Drive normally. Do not alter the route just to satisfy the shadow system.
+What matters in the CSV:
+A) Stable engine remains as good as 0.12/0.13.
+B) Real camera passes should trend toward support/weak_support.
+C) Branches that do not lead to the camera should be outside_coverage/uncertain early and
+   may become conflict only when evidence is strong.
+D) A real pass must NEVER be rejected by the app because shadow still has engine_effect=false.
+
+After the test, send the CSV. The next decision will be data-driven: either keep shadow
+training/coverage expansion, or—only after enough evidence—design a separately guarded
+influence mode. No promotion is automatic.

@@ -9,23 +9,49 @@ import kotlin.math.*
  * Read-only road-geometry shadow evaluator.
  *
  * IMPORTANT: this class is diagnostic only. Its result is appended to field logs and is
- * deliberately NOT used by the v0.12 camera decision path. This lets us validate geometry
- * on real drives without risking a regression in the proven baseline engine.
+ * deliberately NOT used by the proven v0.12 camera decision path.
+ *
+ * v0.14 policy changes are intentionally conservative:
+ *  - multiple proven approaches for the same camera are evaluated together;
+ *  - a matching/supporting approach always wins over a conflicting learned approach;
+ *  - being far from a learned trace is OUTSIDE_COVERAGE, not a conflict;
+ *  - conflict is emitted only when the vehicle is actually close to learned geometry and
+ *    its heading strongly disagrees with every usable learned approach.
+ *
+ * This specifically prevents a partial learned trace from suppressing a real camera if the
+ * shadow system is ever promoted in a later version. In v0.14 it still has zero engine effect.
  */
 class RoadGeometryShadow(context: Context) {
+
+    companion object {
+        const val POLICY = "conservative_multi_approach_v2"
+        private const val SUPPORT_DISTANCE_M = 70f
+        private const val WEAK_SUPPORT_DISTANCE_M = 160f
+        private const val COVERAGE_DISTANCE_M = 180f
+        private const val SUPPORT_HEADING_DEG = 50f
+        private const val WEAK_SUPPORT_HEADING_DEG = 65f
+        private const val CONFLICT_HEADING_DEG = 105f
+    }
 
     data class Result(
         val cameraId: String,
         val source: String,
         val confidence: String,
+        val segmentId: Int,
+        val segmentsConsidered: Int,
+        val inCoverageSegments: Int,
         val corridorDistanceM: Float,
         val headingDeltaDeg: Float,
         val verdict: String
     ) {
         fun toLogFields(): String =
             "roadGeom=available;roadGeomCamera=$cameraId;roadGeomSource=$source;" +
-                "roadGeomConfidence=$confidence;roadGeomDistanceM=${fmt(corridorDistanceM)};" +
-                "roadGeomHeadingDelta=${fmt(headingDeltaDeg)};roadGeomVerdict=$verdict"
+                "roadGeomConfidence=$confidence;roadGeomPolicy=${RoadGeometryShadow.POLICY};" +
+                "roadGeomSegment=$segmentId;roadGeomSegments=$segmentsConsidered;" +
+                "roadGeomInCoverage=$inCoverageSegments;" +
+                "roadGeomDistanceM=${fmt(corridorDistanceM)};" +
+                "roadGeomHeadingDelta=${fmt(headingDeltaDeg)};roadGeomVerdict=$verdict;" +
+                "roadGeomEngineEffect=false"
 
         companion object {
             private fun fmt(v: Float): String = String.format(java.util.Locale.US, "%.1f", v)
@@ -35,11 +61,19 @@ class RoadGeometryShadow(context: Context) {
     private data class Point(val lat: Double, val lon: Double)
 
     private data class Segment(
+        val id: Int,
         val cameraId: String,
         val cameraType: String,
         val source: String,
         val confidence: String,
         val points: List<Point>
+    )
+
+    private data class Candidate(
+        val segment: Segment,
+        val corridorDistanceM: Float,
+        val headingDeltaDeg: Float,
+        val verdict: String
     )
 
     private val segmentsByCamera = HashMap<String, MutableList<Segment>>()
@@ -48,7 +82,7 @@ class RoadGeometryShadow(context: Context) {
     val coveredCameraCount: Int
 
     init {
-        val dbFile = File(context.filesDir, "road_geometry_v1.sqlite")
+        val dbFile = File(context.filesDir, "road_geometry_v2.sqlite")
         context.assets.open("road_geometry.sqlite").use { input ->
             dbFile.outputStream().use { output -> input.copyTo(output) }
         }
@@ -69,6 +103,7 @@ class RoadGeometryShadow(context: Context) {
                     val segmentId = c.getInt(0)
                     val pointList = ArrayList<Point>()
                     val segment = Segment(
+                        id = segmentId,
                         cameraId = c.getString(1),
                         cameraType = c.getString(2),
                         source = c.getString(3),
@@ -112,7 +147,7 @@ class RoadGeometryShadow(context: Context) {
     ): Result? {
         if (!lat.isFinite() || !lon.isFinite()) return null
 
-        var best: Result? = null
+        val candidates = ArrayList<Candidate>()
         for (cameraId in cameraIds) {
             val segments = segmentsByCamera[key(cameraId, cameraType)] ?: continue
             for (segment in segments) {
@@ -122,30 +157,61 @@ class RoadGeometryShadow(context: Context) {
                 } else {
                     180f
                 }
-
-                val verdict = when {
-                    vehicleBearingDeg == null -> "position_only"
-                    nearest.first <= 55f && headingDelta <= 45f -> "support"
-                    nearest.first <= 90f && headingDelta <= 60f -> "weak_support"
-                    nearest.first > 140f || headingDelta > 100f -> "conflict"
-                    else -> "uncertain"
-                }
-
-                val result = Result(
-                    cameraId = cameraId,
-                    source = segment.source,
-                    confidence = segment.confidence,
+                candidates += Candidate(
+                    segment = segment,
                     corridorDistanceM = nearest.first,
                     headingDeltaDeg = headingDelta,
-                    verdict = verdict
+                    verdict = classify(nearest.first, headingDelta, vehicleBearingDeg != null)
                 )
-
-                if (best == null || result.corridorDistanceM < best.corridorDistanceM) {
-                    best = result
-                }
             }
         }
-        return best
+
+        if (candidates.isEmpty()) return null
+
+        val total = candidates.size
+        val inCoverage = candidates.count { it.corridorDistanceM <= COVERAGE_DISTANCE_M }
+
+        // Conservative evidence ordering. A proven matching approach beats a different learned
+        // approach that happens to be closer but points the wrong way. Conflict is selected only
+        // when no support/weak-support/uncertain in-coverage alternative exists.
+        val chosen = chooseBest(candidates, "support")
+            ?: chooseBest(candidates, "weak_support")
+            ?: chooseBest(candidates, "uncertain")
+            ?: chooseBest(candidates, "position_only")
+            ?: chooseBest(candidates, "conflict")
+            ?: candidates.minByOrNull { it.corridorDistanceM }
+            ?: return null
+
+        return Result(
+            cameraId = chosen.segment.cameraId,
+            source = chosen.segment.source,
+            confidence = chosen.segment.confidence,
+            segmentId = chosen.segment.id,
+            segmentsConsidered = total,
+            inCoverageSegments = inCoverage,
+            corridorDistanceM = chosen.corridorDistanceM,
+            headingDeltaDeg = chosen.headingDeltaDeg,
+            verdict = chosen.verdict
+        )
+    }
+
+    private fun chooseBest(candidates: List<Candidate>, verdict: String): Candidate? {
+        return candidates
+            .asSequence()
+            .filter { it.verdict == verdict }
+            .minByOrNull {
+                // Distance remains dominant; heading breaks ties between multiple valid approaches.
+                it.corridorDistanceM + min(it.headingDeltaDeg, 180f) * 0.35f
+            }
+    }
+
+    private fun classify(distanceM: Float, headingDeltaDeg: Float, bearingAvailable: Boolean): String {
+        if (distanceM > COVERAGE_DISTANCE_M) return "outside_coverage"
+        if (!bearingAvailable) return "position_only"
+        if (distanceM <= SUPPORT_DISTANCE_M && headingDeltaDeg <= SUPPORT_HEADING_DEG) return "support"
+        if (distanceM <= WEAK_SUPPORT_DISTANCE_M && headingDeltaDeg <= WEAK_SUPPORT_HEADING_DEG) return "weak_support"
+        if (headingDeltaDeg >= CONFLICT_HEADING_DEG) return "conflict"
+        return "uncertain"
     }
 
     private fun nearestToPolyline(

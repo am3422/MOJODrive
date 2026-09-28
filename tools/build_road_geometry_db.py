@@ -3,7 +3,8 @@
 
 This does NOT alter camera decisions. It learns centerline-like approach traces only for
 camera/direction passes that came within 160 m, so incomplete/abandoned branches do not
-become trusted geometry.
+become trusted geometry. Multiple independently proven approaches may be retained for one
+camera so curved/merged routes are not mistaken for conflicts.
 """
 import argparse, csv, math, os, sqlite3, statistics, time
 from collections import defaultdict
@@ -160,15 +161,16 @@ def main():
     CREATE INDEX idx_road_points_segment ON road_points(segment_id);
     ''')
     meta={
-      'schema_version':'1', 'mode':'shadow_only', 'source_kind':'field_learned_v012',
-      'engine_effect':'false','covered_cameras':str(len(covered_keys)),
+      'schema_version':'2', 'mode':'shadow_only', 'source_kind':'field_learned_stable_v014',
+      'engine_effect':'false','policy':'conservative_multi_approach_v2','covered_cameras':str(len(covered_keys)),
       'build_epoch_ms':str(int(time.time()*1000)),
-      'selection_rule':'same-direction, <=160m near-pass, >=220m route span'
+      'selection_rule':'same-direction, <=160m near-pass, >=220m route span, retain distinct proven approaches',
+      'source_trip_count':str(len(args.logs))
     }
     con.executemany('insert into meta(key,value) values(?,?)',meta.items())
     for sid,(k,src,md,span,travel,conf,pts) in enumerate(sorted(chosen,key=lambda x:(x[0][0],x[0][1])),1):
         c=cams[k]
-        con.execute('insert into road_segments values(?,?,?,?,?,?,?,?,?,?,?)',(sid,k[0],k[1],c['name'],src,'field_learned_v012',conf,md,span,travel,len(pts)))
+        con.execute('insert into road_segments values(?,?,?,?,?,?,?,?,?,?,?)',(sid,k[0],k[1],c['name'],src,'field_learned_stable_v014',conf,md,span,travel,len(pts)))
         con.executemany('insert into road_points values(?,?,?,?)',[(sid,i,p[1],p[2]) for i,p in enumerate(pts)])
     con.commit()
     print('covered cameras:',len(covered_keys),'segments:',len(chosen),'points:',con.execute('select count(*) from road_points').fetchone()[0])

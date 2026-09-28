@@ -421,7 +421,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
                 "ROAD_GEOMETRY_SHADOW_READY",
                 "segments=${roadGeometryShadow?.segmentCount ?: 0};" +
                     "coveredCameras=${roadGeometryShadow?.coveredCameraCount ?: 0};" +
-                    "mode=shadow_only;engine_effect=false"
+                    "mode=shadow_only;engine_effect=false;" +
+                    "policy=${RoadGeometryShadow.POLICY}"
             )
         }
 

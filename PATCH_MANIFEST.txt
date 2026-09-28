@@ -1,31 +1,66 @@
-MOJO Drive MVP 0.13 FULL PATCH MANIFEST
+MOJO Drive MVP 0.14 FULL PATCH MANIFEST
 
-Parent baseline: MVP 0.12 FULL FIXED / commit bcbea01543c29d8c5b4b72f40093a3498bd298d6
-Camera decision engine: LOCKED v0.12 behavior
-Road geometry mode: SHADOW ONLY (engine_effect=false)
+Parent repository state:
+- MOJO Drive MVP 0.13
+- commit: 2b4c07fc99cd02986b5db8f580e68cb091005ae0
+- previous GitHub Actions run #26: SUCCESS
 
-Validation performed before packaging:
-- baseline_guard.py: PASS (29 functions + 22 constants unchanged)
-- replay_harness.py --self-test: PASS (38/38 first-warning encounters exact sequence)
+Runtime policy:
+- Camera/location/speed decision engine: LOCKED v0.12 behavior
+- Road geometry: SHADOW ONLY
+- engine_effect=false
+- shadow policy: conservative_multi_approach_v2
+
+What changed in 0.14:
+- RoadGeometryShadow now evaluates multiple proven approaches per camera.
+- Far from learned route is outside_coverage instead of conflict.
+- Conflict requires close geometry plus strong heading disagreement.
+- Supporting route evidence wins over conflicting alternate learned segments.
+- 0.13 successful field trip added to exact camera replay regression.
+- Road-geometry DB rebuilt from 4 successful field traces.
+- New shadow regression test protects 14302 real pass and 14427 branch/real-pass cases.
+- GitHub Actions runs stable-engine guard + 57-event replay + shadow validation before APK build.
+- App version bumped to 0.14.
+
+Local validation performed before packaging:
+- baseline_guard.py: PASS (29 locked functions + 22 constants unchanged)
+- replay_harness.py --self-test: PASS (57/57 exact first-warning encounters)
+- road_geometry_shadow_test.py: PASS (6/6 field-derived cases)
+- Python tools py_compile: PASS
 - road_geometry.sqlite integrity_check: ok
 - shiraz_cameras.sqlite integrity_check: ok
-- RoadGeometryShadow.kt standalone Kotlin syntax compile: PASS
+- RoadGeometryShadow.kt standalone Kotlin syntax compile with minimal Android stubs: PASS
 
-Key DB facts:
-- camera DB: 267 cameras
-- road geometry: 30 covered cameras, 30 segments, 293 points
+Road geometry DB v2:
+- covered cameras: 30
+- proven approach segments: 42
+- simplified route points: 411
+- source trip count: 4
+- source_kind: field_learned_stable_v014
+- mode: shadow_only
+- engine_effect: false
+
+Important safety note:
+0.14 does NOT allow Road Geometry to suppress, create, delay, or confirm a live camera alert.
+The proven stable matcher remains authoritative during tonight's road test.
+
+Full Android Gradle build is intentionally left to the repository GitHub Actions after upload/push.
+Do not call the APK field-validated until the Action is green and a road test is completed.
 
 SHA-256:
-332ac7dfa3387656d8f259053c3bc9260181f7cbe4e62480eb7f7ae6819c8bfb  app/src/main/java/com/mojotech/mojodrive/LocationService.kt
-103586f0c2ce7843ed414d45b43d107c2ae7b420a5113029ce5a1b64be982659  app/src/main/java/com/mojotech/mojodrive/RoadGeometryShadow.kt
-c474d9cca6734b93609960a70d9cdd84f59b232c402d0dcc2e86e24559a45918  app/src/main/java/com/mojotech/mojodrive/MainActivity.kt
+c66b72217f721c6f249e2fad0458eda3327d17d9658031bb6046ace7d7799059  app/src/main/java/com/mojotech/mojodrive/LocationService.kt
+7e143e655d7109a3982217921254539325f7dec88050e0a76f6789ff31dbb466  app/src/main/java/com/mojotech/mojodrive/RoadGeometryShadow.kt
+56e34a73a045a4b7f728a48d1fea51069280e3644dc76dca6e6b559f1c606527  app/src/main/java/com/mojotech/mojodrive/MainActivity.kt
 de201054b944387fd67f812b9d5a103cece70026177a2cc7b0da9d720a69d8ee  app/src/main/java/com/mojotech/mojodrive/CameraDatabase.kt
 23df223faf7baccd84e4a7111746103d104a75eac7789bdec34df8a67bc79087  app/src/main/assets/shiraz_cameras.sqlite
-4a315553ab448edfbb3a16ad8588b7e627a4935472ffc06fad9b6fd4a22e0a85  app/src/main/assets/road_geometry.sqlite
-8e3a308d68ffbdd9c071c6653de68b4c8315edf1810e62f67981f610c1d4d80a  app/build.gradle.kts
-3ae6418dd8d326e230f13052e0a693b68a88c347bd96356e0b5d833c0dd18305  .github/workflows/build-apk.yml
+4b681b459be7e3cc8fe7a1b46ac5edb31b8126f41e6f249d9053f0ec079648f2  app/src/main/assets/road_geometry.sqlite
+c0964efaddb60970f047b9cfedcd2ee1c99fff8596e9e0bd90bdab58694ac5f4  app/build.gradle.kts
+d6097e5b9f3f6e0c9d2f41209896a51c73436bd25731d673e074d22a4363011b  .github/workflows/build-apk.yml
 fa078c27c9e4bde28a029d673875b028884505efa436b68cf60e1ac0be5b679b  gradle.properties
 21fb363f027fc1b9d1dabd7fde4e39ba14b61e4d46d4f547f9c5ced2914524f9  tools/baseline_guard.py
-0f98aa26e5f748d715db87f14ad245dce25b9b89e84746b537756f86fdac4cf9  tools/replay_harness.py
-f6e89926c4293a686b20b3626a4989c7af375590adf8ca18cde4e62978914e4f  tools/build_road_geometry_db.py
-e5621a2b13d04c6a2de9c71d1d5dbc46836a1f2453703b0ce4638569f7f77fa8  tools/golden_v012_replay.json
+9dc6216900734c531e9732fc106a19e0490400d69400c766ba1fc0b11c3ad383  tools/replay_harness.py
+df7769f10080349a0fc5ae625ec719ac0c775b802b209ee296e2f8f6e87d94d2  tools/build_road_geometry_db.py
+334f512f49a62ff50721c987d93883adb1cf54957fc715cae3282ff345758e0a  tools/road_geometry_shadow_test.py
+990482deef818c795a554443e8462f24c81c8fa356f70bd219b8dd8d9cdd1c86  tools/golden_v012_replay.json
+edac3c6e6e941011dc07712a1506de7c19b31d809e540d89d6feee462ad29ee1  tools/fixtures/v013_shadow_cases.json
+a94eb7a87a51a701a74b8c29c9a1c4eba1b1afb2e3af1a16d988599abf30a714  tools/fixtures/v013_trip_20260927_103727_locations.csv

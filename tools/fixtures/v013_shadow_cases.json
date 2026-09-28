@@ -1,0 +1,60 @@
+{
+  "source_trip": "MOJODrive_Trip_20260927_103727.csv",
+  "purpose": "Field-derived shadow-geometry regression cases. These do not change camera alerts.",
+  "cases": [
+    {
+      "name": "14302 real camera first warning must never be false conflict",
+      "camera_id": "14302",
+      "camera_type": "speed",
+      "lat": 29.6734667,
+      "lon": 52.4973067,
+      "bearing": 161.0,
+      "allowed": ["support", "weak_support", "uncertain", "outside_coverage"]
+    },
+    {
+      "name": "14302 real near pass should be supported",
+      "camera_id": "14302",
+      "camera_type": "speed",
+      "lat": 29.6692700,
+      "lon": 52.4985533,
+      "bearing": 165.0,
+      "allowed": ["support", "weak_support"]
+    },
+    {
+      "name": "14427 abandoned branch should not look supported at warning",
+      "camera_id": "14427",
+      "camera_type": "speed",
+      "lat": 29.6634600,
+      "lon": 52.5016550,
+      "bearing": 180.0,
+      "allowed": ["uncertain", "outside_coverage", "conflict"]
+    },
+    {
+      "name": "14427 abandoned branch becomes conflict once close to learned corridor with wrong heading",
+      "camera_id": "14427",
+      "camera_type": "speed",
+      "lat": 29.6606600,
+      "lon": 52.5008517,
+      "bearing": 231.0,
+      "allowed": ["conflict"]
+    },
+    {
+      "name": "14427 later real approach must be supported",
+      "camera_id": "14427",
+      "camera_type": "speed",
+      "lat": 29.6603233,
+      "lon": 52.5023650,
+      "bearing": 99.0,
+      "allowed": ["support", "weak_support"]
+    },
+    {
+      "name": "14293 real approach remains supported",
+      "camera_id": "14293",
+      "camera_type": "speed",
+      "lat": 29.6616033,
+      "lon": 52.5015717,
+      "bearing": 196.0,
+      "allowed": ["support", "weak_support"]
+    }
+  ]
+}

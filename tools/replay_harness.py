@@ -412,7 +412,8 @@ def self_test(root: Path, db: Path, golden_path: Path) -> int:
         for f in failures:
             print(" -", f)
         return 3
-    print("REPLAY SELF-TEST: PASS — 38/38 golden first-warning encounters reproduced exactly")
+    total = sum(len(v) for v in golden["trips"].values())
+    print(f"REPLAY SELF-TEST: PASS — {total}/{total} golden first-warning encounters reproduced exactly")
     return 0
 
 

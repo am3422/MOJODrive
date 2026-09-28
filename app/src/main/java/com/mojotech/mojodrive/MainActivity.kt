@@ -73,7 +73,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.13 • Stable 0.12 Engine + Replay Guard + Road Geometry Shadow"
+            text = "MVP 0.14 • Stable 0.12 Engine + Conservative Road Geometry Shadow"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(12))
@@ -175,9 +175,10 @@ class MainActivity : Activity() {
 
         root.addView(TextView(this).apply {
             text =
-                "0.13 keeps the proven 0.12 location, speed, camera matching and alert engine locked. " +
-                "Replay regression guards run before every build. Road geometry is collected in SHADOW mode only, " +
-                "so tomorrow's drive can validate it without changing a single camera decision."
+                "0.14 keeps the proven 0.12 location, speed, camera matching and alert engine locked. " +
+                "Replay regression guards still run before every build. Road geometry remains SHADOW ONLY, " +
+                "but now learns multiple proven approaches and uses conservative conflict rules so partial routes " +
+                "cannot falsely override a real camera."
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(14), 0, 0)
@@ -220,7 +221,7 @@ class MainActivity : Activity() {
                 .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
         )
 
-        Toast.makeText(this, "MOJO Drive 0.13 started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.14 started.", Toast.LENGTH_SHORT).show()
     }
 
     private fun markEvent() {
