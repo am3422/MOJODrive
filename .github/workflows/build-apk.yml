@@ -32,8 +32,14 @@ jobs:
       - name: Replay golden stable trips
         run: python3 tools/replay_harness.py --self-test
 
-      - name: Validate conservative road geometry shadow
+      - name: Validate road geometry evidence
         run: python3 tools/road_geometry_shadow_test.py
+
+      - name: Validate field-warning veto regression
+        run: python3 tools/negative_route_warning_regression.py
+
+      - name: Guard explicit negative-route live veto
+        run: python3 tools/negative_route_veto_guard.py
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
@@ -41,5 +47,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MOJODrive-MVP-0.14-debug
+          name: MOJODrive-MVP-0.15-debug
           path: app/build/outputs/apk/debug/app-debug.apk

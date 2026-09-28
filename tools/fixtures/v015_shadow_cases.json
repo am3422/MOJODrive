@@ -1,0 +1,65 @@
+{
+  "purpose": "Field-derived regression cases for v0.15 shadow policy. None of these cases may change live camera alerts.",
+  "cases": [
+    {
+      "name": "14302 real first warning remains conservative outside coverage",
+      "camera_id": "14302", "camera_type": "speed",
+      "lat": 29.6734667, "lon": 52.4973067, "bearing": 161.0,
+      "allowed": ["support", "weak_support", "uncertain", "outside_coverage"]
+    },
+    {
+      "name": "14302 real near pass is supported",
+      "camera_id": "14302", "camera_type": "speed",
+      "lat": 29.6692700, "lon": 52.4985533, "bearing": 165.0,
+      "allowed": ["support", "weak_support"]
+    },
+    {
+      "name": "14427 branch warning is not falsely supported",
+      "camera_id": "14427", "camera_type": "speed",
+      "lat": 29.6634600, "lon": 52.5016550, "bearing": 180.0,
+      "allowed": ["uncertain", "outside_coverage", "conflict"]
+    },
+    {
+      "name": "14427 abandoned branch becomes conflict close to positive learned route",
+      "camera_id": "14427", "camera_type": "speed",
+      "lat": 29.6606600, "lon": 52.5008517, "bearing": 231.0,
+      "allowed": ["conflict"]
+    },
+    {
+      "name": "14427 later real approach remains supported",
+      "camera_id": "14427", "camera_type": "speed",
+      "lat": 29.6603233, "lon": 52.5023650, "bearing": 99.0,
+      "allowed": ["support", "weak_support"]
+    },
+    {
+      "name": "14293 real approach remains supported",
+      "camera_id": "14293", "camera_type": "speed",
+      "lat": 29.6616033, "lon": 52.5015717, "bearing": 196.0,
+      "allowed": ["support", "weak_support"]
+    },
+    {
+      "name": "14550 known opposite-level approach is explicit negative route",
+      "camera_id": "14550", "camera_type": "speed",
+      "lat": 29.6519150, "lon": 52.5092950, "bearing": 120.0,
+      "allowed": ["negative_route"]
+    },
+    {
+      "name": "14550 closest opposite-level pass remains explicit negative route",
+      "camera_id": "14550", "camera_type": "speed",
+      "lat": 29.6499783, "lon": 52.5130417, "bearing": 119.0,
+      "allowed": ["negative_route"]
+    },
+    {
+      "name": "14550 user-confirmed final false warning is explicit negative route",
+      "camera_id": "14550", "camera_type": "speed",
+      "lat": 29.6487567, "lon": 52.5154650, "bearing": 341.0,
+      "allowed": ["negative_route"]
+    },
+    {
+      "name": "14550 actual camera coordinate is not blanket-labeled negative",
+      "camera_id": "14550", "camera_type": "speed",
+      "lat": 29.6514444, "lon": 52.5137633, "bearing": 304.0,
+      "allowed": ["outside_coverage", "support", "weak_support", "uncertain"]
+    }
+  ]
+}

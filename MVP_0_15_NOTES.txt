@@ -1,0 +1,117 @@
+MOJO Drive MVP 0.15 — Guarded Explicit Negative-Route Veto
+==========================================================
+
+WHY THIS VERSION EXISTS
+-----------------------
+The 0.14 field trip on 2026-09-28 exposed one concrete false warning at the end of the
+route: camera 14550 existed on the opposite carriageway/level while the vehicle remained
+on the hill route. The unchanged core matcher initially rejected it correctly, but after
+the vehicle direction changed the 2D geometry later considered the camera ahead and emitted
+a first warning.
+
+0.15 fixes only that class of error in the narrowest reversible way supported by our current
+field evidence. It does NOT retune camera thresholds, GPS, speed fusion, direction gates,
+clustering, warning distance, alert cadence, overspeed, or the previously validated positive
+Road Geometry behavior.
+
+WHAT IS STILL LOCKED
+--------------------
+The field-validated v0.12 camera/location/speed engine remains the base decision engine.
+The baseline guard still protects 29 functions and 22 critical constants.
+
+Generic Road Geometry remains diagnostic/shadow-only:
+- support cannot create an alert
+- weak_support cannot create an alert
+- conflict cannot suppress an alert
+- outside_coverage cannot suppress an alert
+- uncertain cannot suppress an alert
+
+THE ONLY NEW LIVE INFLUENCE
+---------------------------
+An explicit, human-confirmed NEGATIVE route may veto the FIRST alert for the matching
+camera only when all of these are true:
+1. the negative route is explicitly stored in exclusion_segments;
+2. the current camera ID/type matches that negative route;
+3. the vehicle is within 85 m of the labeled route polyline;
+4. vehicle heading is within 60 degrees of that labeled route direction;
+5. no already-proven positive approach is currently support/weak_support;
+6. this is the first alert (state.warned == false);
+7. this is a live-location decision, not a GPS bridge.
+
+If those conditions match, the event is logged as:
+  CAMERA_NEGATIVE_ROUTE_SUPPRESSED
+
+The camera remains trackable. If the vehicle later leaves the negative route and genuinely
+approaches the real camera, the normal engine can still alert. Once an alert has already
+started, Road Geometry is never allowed to mute it.
+
+CURRENT NEGATIVE SCOPE
+----------------------
+For tonight's test the explicit-negative DB is intentionally tiny:
+- camera: 14550 only
+- field-confirmed negative route segments: 2
+- source: 2026-09-28 09:48 trip
+- reason: user-confirmed opposite carriageway/level + hill-route false warning
+
+This is deliberate. 0.15 does not generalize one observation to all bridges, hills, ramps,
+or parallel roads.
+
+ROAD GEOMETRY DB v3
+-------------------
+Positive field geometry is unchanged:
+- 30 positive covered cameras
+- 42 proven positive approach segments
+- 411 positive route points
+
+Explicit negative geometry:
+- 1 negative-covered camera
+- 2 labeled negative segments
+- 13 simplified negative route points
+
+Positive learning excludes any trip used as explicit negative ground truth, preventing the
+same false-warning trip from silently self-training positive geometry.
+
+REGRESSION RESULTS BEFORE PACKAGING
+-----------------------------------
+- Conservative Road Geometry field cases: 10/10 PASS
+- v0.14 first-warning negative-veto regression: 20/20 PASS
+  - 19 earlier first warnings remain NOT vetoed
+  - exactly the user-confirmed final camera 14550 warning matches the veto
+- The real camera coordinate itself is NOT blanket-labeled negative
+- road_geometry.sqlite PRAGMA integrity_check: ok
+- RoadGeometryShadow.kt standalone Kotlin syntax compile: PASS
+- Python tools py_compile: PASS
+- Parent LocationService blob expected by installer:
+  0c84d897d49f829a953835afaa4f0e7060aabcff
+- Expected parent repository commit:
+  228de2611c0e3f230357870287b0023c0ec2ed96 (MVP 0.14)
+
+CI ORDER
+--------
+1. Guard stable v0.12 engine
+2. Replay golden stable trips (pure core matcher)
+3. Validate road geometry evidence
+4. Validate field-warning veto regression
+5. Guard explicit negative-route live veto
+6. Build debug APK
+7. Upload MOJODrive-MVP-0.15-debug
+
+IMPORTANT REPLAY NOTE
+---------------------
+The pure-core golden replay intentionally still contains all 20 first warnings from the
+0.14 trip, including 14550. That proves the old matcher itself has not been rewritten.
+The separate guarded-veto regression then proves that the new outer guard removes exactly
+14550 and none of the other 19 first warnings.
+
+TONIGHT'S TEST
+--------------
+Drive normally. If practical, repeat the final hill/opposite-carriageway area where 14550
+warned before. Do not interact with the phone while driving.
+
+Expected behavior there:
+- no first audible/vibration warning for 14550 while on the confirmed hill false-route;
+- the log should contain CAMERA_NEGATIVE_ROUTE_SUPPRESSED;
+- other normal cameras should behave exactly as before.
+
+After the drive, send the CSV. Do not promote other cameras into explicit-negative evidence
+without concrete field ground truth.

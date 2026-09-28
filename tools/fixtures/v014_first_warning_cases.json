@@ -1,0 +1,186 @@
+{
+  "source_trip": "MOJODrive_Trip_20260928_094832.csv",
+  "ground_truth": "User confirmed only the final camera 14550 warning was false because the camera was on the opposite carriageway/level while the vehicle was on the hill route.",
+  "cases": [
+    {
+      "iso_time": "2026-09-28T09:58:19.641",
+      "camera_id": "10397|12503",
+      "camera_type": "speed",
+      "lat": 29.8066783,
+      "lon": 52.4803317,
+      "bearing": 183.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:04:54.614",
+      "camera_id": "10546",
+      "camera_type": "speed",
+      "lat": 29.77988,
+      "lon": 52.4962183,
+      "bearing": 229.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:07:12.661",
+      "camera_id": "9871",
+      "camera_type": "speed",
+      "lat": 29.7720917,
+      "lon": 52.4685633,
+      "bearing": 234.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:09:15.578",
+      "camera_id": "12512",
+      "camera_type": "speed",
+      "lat": 29.7582783,
+      "lon": 52.4448117,
+      "bearing": 245.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:10:58.624",
+      "camera_id": "12283",
+      "camera_type": "speed",
+      "lat": 29.7481733,
+      "lon": 52.4314983,
+      "bearing": 160.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:15:17.581",
+      "camera_id": "13199",
+      "camera_type": "speed",
+      "lat": 29.7258733,
+      "lon": 52.4495583,
+      "bearing": 91.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:16:38.609",
+      "camera_id": "13696",
+      "camera_type": "speed",
+      "lat": 29.71563,
+      "lon": 52.4640067,
+      "bearing": 119.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:17:39.612",
+      "camera_id": "13792",
+      "camera_type": "speed",
+      "lat": 29.7073517,
+      "lon": 52.4753367,
+      "bearing": 149.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:18:15.609",
+      "camera_id": "13895",
+      "camera_type": "speed",
+      "lat": 29.7006983,
+      "lon": 52.4794217,
+      "bearing": 130.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:19:27.616",
+      "camera_id": "13847",
+      "camera_type": "speed",
+      "lat": 29.6884733,
+      "lon": 52.48318,
+      "bearing": 191.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:19:39.617",
+      "camera_id": "13941",
+      "camera_type": "speed",
+      "lat": 29.6858067,
+      "lon": 52.48363,
+      "bearing": 158.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:20:03.610",
+      "camera_id": "14195",
+      "camera_type": "speed",
+      "lat": 29.6826517,
+      "lon": 52.48801,
+      "bearing": 121.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:20:27.609",
+      "camera_id": "14270",
+      "camera_type": "speed",
+      "lat": 29.6799733,
+      "lon": 52.4923467,
+      "bearing": 134.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:21:00.618",
+      "camera_id": "14302",
+      "camera_type": "speed",
+      "lat": 29.6745167,
+      "lon": 52.4967883,
+      "bearing": 151.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:21:59.615",
+      "camera_id": "14427",
+      "camera_type": "speed",
+      "lat": 29.6642133,
+      "lon": 52.5015833,
+      "bearing": 171.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:22:14.614",
+      "camera_id": "14293",
+      "camera_type": "speed",
+      "lat": 29.66156,
+      "lon": 52.5015717,
+      "bearing": 195.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:25:27.621",
+      "camera_id": "14427",
+      "camera_type": "speed",
+      "lat": 29.6603033,
+      "lon": 52.502505,
+      "bearing": 97.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:25:44.613",
+      "camera_id": "14524",
+      "camera_type": "speed",
+      "lat": 29.6587133,
+      "lon": 52.5047483,
+      "bearing": 139.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:28:11.590",
+      "camera_id": "14646",
+      "camera_type": "speed",
+      "lat": 29.6500983,
+      "lon": 52.5127983,
+      "bearing": 119.0,
+      "expected_explicit_negative_veto": false
+    },
+    {
+      "iso_time": "2026-09-28T10:28:53.785",
+      "camera_id": "14550",
+      "camera_type": "speed",
+      "lat": 29.6487567,
+      "lon": 52.515465,
+      "bearing": 341.0,
+      "expected_explicit_negative_veto": true
+    }
+  ]
+}

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""MOJO Drive stable-baseline guard.
+"""MOJO Drive stable-baseline guard with one explicit v0.15 extension allowance.
 
-Fails CI if a proven v0.12 engine function changes accidentally. Diagnostic/logging
-extensions may live outside these locked functions. Deliberate engine work requires a
-new field-validated baseline and then an explicit hash update.
+The field-validated v0.12 camera/location/speed engine remains locked. v0.15 allows exactly
+one marked insertion inside computeAlertRequest: the guarded explicit-negative-route FIRST
+alert veto. The guard removes that marked block before hashing, so the underlying v0.12
+function must still match byte-for-byte. Every other protected function and critical
+constant must remain unchanged.
 """
 from __future__ import annotations
-import argparse, hashlib, re, sys
+import argparse, hashlib, re
 from pathlib import Path
 
 EXPECTED = {
@@ -66,6 +68,9 @@ LOCKED_CONSTANTS = {
     "FIRST_ALERT_FORCE_MS": "1200L"
 }
 
+VETO_BEGIN = "// BEGIN V0.15 GUARDED NEGATIVE ROUTE VETO"
+VETO_END = "// END V0.15 GUARDED NEGATIVE ROUTE VETO"
+
 
 def extract_function(src: str, name: str) -> str:
     m = re.search(r"(?m)^\s*(?:private\s+|override\s+|@\w+\s+)*fun\s+" + re.escape(name) + r"\s*\(", src)
@@ -90,6 +95,49 @@ def extract_function(src: str, name: str) -> str:
     raise ValueError(f"unclosed body: {name}")
 
 
+def normalize_allowed_extension(name: str, body: str) -> str:
+    if name != "computeAlertRequest":
+        return body
+
+    if body.count(VETO_BEGIN) != 1 or body.count(VETO_END) != 1:
+        raise ValueError("v0.15 guarded veto markers missing or duplicated")
+
+    # The insertion is surrounded by the same blank line that existed in v0.12. Removing
+    # this entire marked block must restore the original field-validated function byte-for-byte.
+    pattern = re.compile(
+        r"\n\n        // BEGIN V0\.15 GUARDED NEGATIVE ROUTE VETO\n.*?"
+        r"        // END V0\.15 GUARDED NEGATIVE ROUTE VETO\n",
+        re.S,
+    )
+    normalized, count = pattern.subn("\n\n", body)
+    if count != 1:
+        raise ValueError(f"unable to isolate guarded veto block (matches={count})")
+
+    # Guard the intent of the allowed block too. Generic conflict/support can NEVER veto.
+    block = body[body.index(VETO_BEGIN): body.index(VETO_END) + len(VETO_END)]
+    required = [
+        '!bridge && !state.warned',
+        'explicitNegative?.verdict == "negative_route"',
+        'explicitNegative.evidenceKind == "explicit_negative"',
+        'CAMERA_NEGATIVE_ROUTE_SUPPRESSED',
+        'return null',
+    ]
+    for token in required:
+        if token not in block:
+            raise ValueError(f"guarded veto lost required condition/token: {token}")
+    forbidden = [
+        'verdict == "conflict"',
+        'verdict == "outside_coverage"',
+        'verdict == "uncertain"',
+        'verdict == "support"',
+        'verdict == "weak_support"',
+    ]
+    for token in forbidden:
+        if token in block:
+            raise ValueError(f"generic road-geometry verdict illegally used by live veto: {token}")
+    return normalized
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default="app/src/main/java/com/mojotech/mojodrive/LocationService.kt")
@@ -100,12 +148,13 @@ def main() -> int:
     for name, expected in EXPECTED.items():
         try:
             body = extract_function(src, name)
+            body = normalize_allowed_extension(name, body)
         except Exception as e:
             failures.append(f"{name}: {e}")
             continue
         actual = hashlib.sha256(body.encode("utf-8")).hexdigest()
         if actual != expected:
-            failures.append(f"{name}: changed ({actual[:12]} != {expected[:12]})")
+            failures.append(f"{name}: locked baseline changed ({actual[:12]} != {expected[:12]})")
 
     for name, expected in LOCKED_CONSTANTS.items():
         m = re.search(r"private const val\s+" + re.escape(name) + r"\s*=\s*([^\n]+)", src)
@@ -120,10 +169,13 @@ def main() -> int:
         print("BASELINE GUARD: FAIL")
         for f in failures:
             print(" -", f)
-        print("\nThe field-validated v0.12 engine is locked. Do not update hashes unless a deliberate engine change has passed replay + road test.")
+        print("\nThe field-validated v0.12 engine is locked. v0.15 permits only the marked explicit-negative FIRST-alert veto.")
         return 2
 
-    print(f"BASELINE GUARD: PASS ({len(EXPECTED)} locked functions + {len(LOCKED_CONSTANTS)} constants unchanged)")
+    print(
+        f"BASELINE GUARD: PASS ({len(EXPECTED)} protected functions, including one normalized v0.15 veto extension, "
+        f"+ {len(LOCKED_CONSTANTS)} constants unchanged)"
+    )
     return 0
 
 if __name__ == "__main__":

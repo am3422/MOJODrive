@@ -1,66 +1,88 @@
-MOJO Drive MVP 0.14 FULL PATCH MANIFEST
+MOJO Drive MVP 0.15 SAFE PATCH MANIFEST
+========================================
 
-Parent repository state:
-- MOJO Drive MVP 0.13
-- commit: 2b4c07fc99cd02986b5db8f580e68cb091005ae0
-- previous GitHub Actions run #26: SUCCESS
+PATCH TYPE
+----------
+Safe overlay for exact parent:
+- repository: am3422/MOJODrive
+- parent commit: 228de2611c0e3f230357870287b0023c0ec2ed96
+- parent version: MVP 0.14
+- expected parent LocationService git blob: 0c84d897d49f829a953835afaa4f0e7060aabcff
 
-Runtime policy:
-- Camera/location/speed decision engine: LOCKED v0.12 behavior
-- Road geometry: SHADOW ONLY
-- engine_effect=false
-- shadow policy: conservative_multi_approach_v2
+LocationService.kt is intentionally NOT included as a blind replacement.
+apply_v015.py verifies that exact parent blob and refuses to patch anything else.
+It then performs four exact, reviewable edits only.
 
-What changed in 0.14:
-- RoadGeometryShadow now evaluates multiple proven approaches per camera.
-- Far from learned route is outside_coverage instead of conflict.
-- Conflict requires close geometry plus strong heading disagreement.
-- Supporting route evidence wins over conflicting alternate learned segments.
-- 0.13 successful field trip added to exact camera replay regression.
-- Road-geometry DB rebuilt from 4 successful field traces.
-- New shadow regression test protects 14302 real pass and 14427 branch/real-pass cases.
-- GitHub Actions runs stable-engine guard + 57-event replay + shadow validation before APK build.
-- App version bumped to 0.14.
+RUNTIME CHANGE
+--------------
+Generic Road Geometry remains shadow-only.
+The only new live behavior is a guarded FIRST-alert veto when an explicitly user-confirmed
+negative-route segment matches camera ID/type + position + heading, and the alert is not a
+GPS-bridge alert.
 
-Local validation performed before packaging:
-- baseline_guard.py: PASS (29 locked functions + 22 constants unchanged)
-- replay_harness.py --self-test: PASS (57/57 exact first-warning encounters)
-- road_geometry_shadow_test.py: PASS (6/6 field-derived cases)
-- Python tools py_compile: PASS
-- road_geometry.sqlite integrity_check: ok
-- shiraz_cameras.sqlite integrity_check: ok
-- RoadGeometryShadow.kt standalone Kotlin syntax compile with minimal Android stubs: PASS
+Current explicit-negative scope is camera 14550 only, based on the user's field-confirmed
+opposite-carriageway/level + hill-route false warning in the 2026-09-28 test.
 
-Road geometry DB v2:
-- covered cameras: 30
-- proven approach segments: 42
-- simplified route points: 411
-- source trip count: 4
-- source_kind: field_learned_stable_v014
-- mode: shadow_only
-- engine_effect: false
+No existing camera matcher threshold, direction gate, location pipeline, speed fusion,
+warning-distance rule, alert cadence, overspeed rule, or camera DB record was retuned.
 
-Important safety note:
-0.14 does NOT allow Road Geometry to suppress, create, delay, or confirm a live camera alert.
-The proven stable matcher remains authoritative during tonight's road test.
+ROAD GEOMETRY DB v3
+-------------------
+- integrity_check: ok
+- positive covered cameras: 30
+- positive segments: 42
+- positive points: 411
+- explicit negative covered cameras: 1
+- explicit negative segments: 2
+- explicit negative points: 13
+- explicit negative camera IDs: 14550 only
+- mode: guarded_negative_veto
+- generic_geometry_engine_effect=false
+- explicit_negative_veto=true
 
-Full Android Gradle build is intentionally left to the repository GitHub Actions after upload/push.
-Do not call the APK field-validated until the Action is green and a road test is completed.
+LOCAL VALIDATION BEFORE PACKAGING
+---------------------------------
+PASS: Python tools py_compile
+PASS: RoadGeometryShadow.kt standalone Kotlin syntax compile with Android stubs
+PASS: road_geometry_shadow_test.py — 10/10 field cases
+PASS: negative_route_warning_regression.py — 20/20 v0.14 first-warning cases
+      exactly the final 14550 false warning matches explicit-negative veto;
+      the other 19 first warnings do not.
+PASS: pure locked-core replay of latest v0.14 location trace reproduces 20 first warnings,
+      including 14550 before the separate veto layer.
+PASS: road_geometry.sqlite integrity_check = ok
+PASS: installer replacement anchors verified against the live parent LocationService on GitHub
+      (each exact replacement anchor occurs once; parent blob matches expected hash).
 
-SHA-256:
-c66b72217f721c6f249e2fad0458eda3327d17d9658031bb6046ace7d7799059  app/src/main/java/com/mojotech/mojodrive/LocationService.kt
-7e143e655d7109a3982217921254539325f7dec88050e0a76f6789ff31dbb466  app/src/main/java/com/mojotech/mojodrive/RoadGeometryShadow.kt
-56e34a73a045a4b7f728a48d1fea51069280e3644dc76dca6e6b559f1c606527  app/src/main/java/com/mojotech/mojodrive/MainActivity.kt
-de201054b944387fd67f812b9d5a103cece70026177a2cc7b0da9d720a69d8ee  app/src/main/java/com/mojotech/mojodrive/CameraDatabase.kt
+CI AFTER INSTALL/PUSH
+---------------------
+GitHub Actions will run the checks that require the fully patched repository source:
+1. Guard stable v0.12 engine
+2. Replay golden stable trips — expected total 77/77 exact core first warnings
+3. Validate road geometry evidence
+4. Validate field-warning veto regression
+5. Guard explicit negative-route live veto
+6. Android Gradle build
+7. Upload MOJODrive-MVP-0.15-debug
+
+The APK should be considered build-validated only after that Action is green.
+
+SHA-256
+-------
+2674a62b769a1f937a3f3c139dc14f89226ef56844bb016712b8f1ef04ca4845  .github/workflows/build-apk.yml
+5170438a68c8b47368de6c7ecf9990faaac3bd9a20334c847203b8fecc41de6c  app/build.gradle.kts
+a4eec0329c9fb4bdc0a43514d452148f74203fc693bb8201610668481984b84c  app/src/main/java/com/mojotech/mojodrive/MainActivity.kt
+b04ee8d1325d10962c589cbdb9a38adbf3228a73a4be675eda902a916fa95cbb  app/src/main/java/com/mojotech/mojodrive/RoadGeometryShadow.kt
+ece1de364e46cb82ecf08d12ab2d7e137b18469640f8ff82d2cfb6ce0596411b  app/src/main/assets/road_geometry.sqlite
 23df223faf7baccd84e4a7111746103d104a75eac7789bdec34df8a67bc79087  app/src/main/assets/shiraz_cameras.sqlite
-4b681b459be7e3cc8fe7a1b46ac5edb31b8126f41e6f249d9053f0ec079648f2  app/src/main/assets/road_geometry.sqlite
-c0964efaddb60970f047b9cfedcd2ee1c99fff8596e9e0bd90bdab58694ac5f4  app/build.gradle.kts
-d6097e5b9f3f6e0c9d2f41209896a51c73436bd25731d673e074d22a4363011b  .github/workflows/build-apk.yml
-fa078c27c9e4bde28a029d673875b028884505efa436b68cf60e1ac0be5b679b  gradle.properties
-21fb363f027fc1b9d1dabd7fde4e39ba14b61e4d46d4f547f9c5ced2914524f9  tools/baseline_guard.py
-9dc6216900734c531e9732fc106a19e0490400d69400c766ba1fc0b11c3ad383  tools/replay_harness.py
-df7769f10080349a0fc5ae625ec719ac0c775b802b209ee296e2f8f6e87d94d2  tools/build_road_geometry_db.py
-334f512f49a62ff50721c987d93883adb1cf54957fc715cae3282ff345758e0a  tools/road_geometry_shadow_test.py
-990482deef818c795a554443e8462f24c81c8fa356f70bd219b8dd8d9cdd1c86  tools/golden_v012_replay.json
-edac3c6e6e941011dc07712a1506de7c19b31d809e540d89d6feee462ad29ee1  tools/fixtures/v013_shadow_cases.json
-a94eb7a87a51a701a74b8c29c9a1c4eba1b1afb2e3af1a16d988599abf30a714  tools/fixtures/v013_trip_20260927_103727_locations.csv
+e389c44bcd0ca0010da5f5ec70d1d7e9ef36d40bd9227548e338b60fb189d24b  apply_v015.py
+0a52a086d718e842f440a150dfdcfdf6dae0aa457bcc8419ff285cb899af6def  tools/baseline_guard.py
+a921856d5a321d5cd654fa489d1333d404af3db2ce9456eee97e076e2a4f939f  tools/build_road_geometry_db.py
+b87437c629a36b5988218f4920cccd55e502633ee1c4f9a5975e287a12f7bf7c  tools/negative_route_veto_guard.py
+8141afaaa8672af03c8346d519ef913d2bd0c53fcdc560e26bbc1604fd97f8ee  tools/negative_route_warning_regression.py
+4c73defb43832f697470e00f05f42a254f98c32c84ccc69a84e028c546509873  tools/road_geometry_shadow_test.py
+758f14e41a18101457809e919d0be8b91d4bc73a7fffb6b06f6aec0fbf5a374d  tools/golden_v012_replay.json
+ff10ea95c4ffd7f0087dfce6883c023463477a3229fa22763bc69942a1b2556b  tools/fixtures/negative_routes_v015.json
+8f21011dd52a85bdfc093adc07b1ad25538c6399887373642fc89af741dda0ed  tools/fixtures/v014_first_warning_cases.json
+0f63c09ec0fe32d7df6c265003915df832f52beaeef336c04667dbe694e31ee9  tools/fixtures/v014_trip_20260928_094832_locations.csv
+35b050f9dbe7207e2aa611a0b8f6f02de7aee314acadc74b7ba22eafaa29e80a  tools/fixtures/v015_shadow_cases.json

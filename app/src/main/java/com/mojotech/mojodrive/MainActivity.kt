@@ -73,7 +73,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "MVP 0.14 • Stable 0.12 Engine + Conservative Road Geometry Shadow"
+            text = "MVP 0.15 • Stable 0.12 Engine + Guarded Negative-Route Veto"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(12))
@@ -175,10 +175,9 @@ class MainActivity : Activity() {
 
         root.addView(TextView(this).apply {
             text =
-                "0.14 keeps the proven 0.12 location, speed, camera matching and alert engine locked. " +
-                "Replay regression guards still run before every build. Road geometry remains SHADOW ONLY, " +
-                "but now learns multiple proven approaches and uses conservative conflict rules so partial routes " +
-                "cannot falsely override a real camera."
+                "0.15 keeps the proven 0.12 location, speed and camera matcher thresholds locked. " +
+                "Generic Road Geometry remains SHADOW ONLY. The only live influence is a narrow FIRST-alert veto " +
+                "when an explicitly user-confirmed false route matches both position and heading; generic conflict cannot suppress an alert."
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, dp(14), 0, 0)
@@ -221,7 +220,7 @@ class MainActivity : Activity() {
                 .putExtra(LocationService.EXTRA_THRESHOLD_KMH, threshold)
         )
 
-        Toast.makeText(this, "MOJO Drive 0.14 started.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MOJO Drive 0.15 started.", Toast.LENGTH_SHORT).show()
     }
 
     private fun markEvent() {
@@ -339,7 +338,7 @@ class MainActivity : Activity() {
 
         statusText.text =
             when {
-                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • roadGeom $roadGeometryCameras shadow • location stalls $stalls • $batteryState • LIVE LOG"
+                running -> "ACTIVE • $provider • $raw DB / $clusters clusters • $confirmed confirmed • roadGeom $roadGeometryCameras guarded • location stalls $stalls • $batteryState • LIVE LOG"
                 tripActive -> "Trip interrupted • persistent log waiting for recovery"
                 else -> "Stopped"
             }

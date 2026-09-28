@@ -67,7 +67,29 @@
       "speed:14427",
       "speed:14524",
       "speed:14646"
+    ],
+    "v014_trip_20260928_094832_locations.csv": [
+      "speed:10397+12503",
+      "speed:10546",
+      "speed:9871",
+      "speed:12512",
+      "speed:12283",
+      "speed:13199",
+      "speed:13696",
+      "speed:13792",
+      "speed:13895",
+      "speed:13847",
+      "speed:13941",
+      "speed:14195",
+      "speed:14270",
+      "speed:14302",
+      "speed:14427",
+      "speed:14293",
+      "speed:14427",
+      "speed:14524",
+      "speed:14646",
+      "speed:14550"
     ]
   },
-  "field_validation_note": "Includes the successful v0.13 shadow-only drive while preserving the same locked v0.12 camera engine."
+  "field_validation_note": "Five field traces replay the unchanged v0.12 core matcher. The v0.14 14550 warning intentionally remains in the pure-core golden sequence; MVP 0.15 suppresses it only afterward through the separately guarded explicit-negative FIRST-alert veto."
 }

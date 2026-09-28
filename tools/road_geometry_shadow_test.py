@@ -1,180 +1,129 @@
 #!/usr/bin/env python3
-"""Regression test for the v0.14 conservative road-geometry shadow policy.
+"""Regression test for MVP 0.15 road-geometry shadow policy.
 
-The production Android evaluator remains SHADOW ONLY. This test uses the same policy and
-bundled road_geometry.sqlite to ensure field-proven examples do not regress before an APK
-is built. In particular, the real 14302 pass must not be called a conflict, while the
-abandoned 14427 branch may become a conflict only after the car is close to learned route
-geometry and strongly heading away from it.
+Tests both the v0.14 conservative positive-road behavior and the new v0.15 explicit
+negative-route evidence. Generic geometry remains SHADOW ONLY; only the explicit negative
+route verdict is eligible for the separately guarded first-alert veto.
 """
 from __future__ import annotations
-import json, math, sqlite3, sys
+import json, math, sqlite3
 from pathlib import Path
 
-SUPPORT_DISTANCE_M = 70.0
-WEAK_SUPPORT_DISTANCE_M = 160.0
-COVERAGE_DISTANCE_M = 180.0
-SUPPORT_HEADING_DEG = 50.0
-WEAK_SUPPORT_HEADING_DEG = 65.0
-CONFLICT_HEADING_DEG = 105.0
-POLICY = "conservative_multi_approach_v2"
+SUPPORT_DISTANCE_M=70.0
+WEAK_SUPPORT_DISTANCE_M=160.0
+COVERAGE_DISTANCE_M=180.0
+SUPPORT_HEADING_DEG=50.0
+WEAK_SUPPORT_HEADING_DEG=65.0
+CONFLICT_HEADING_DEG=105.0
+NEGATIVE_ROUTE_DISTANCE_M=85.0
+NEGATIVE_ROUTE_HEADING_DEG=60.0
+POLICY="conservative_multi_approach_negative_route_v3"
 
-ROOT = Path(__file__).resolve().parents[1]
-DB = ROOT / "app/src/main/assets/road_geometry.sqlite"
-CASES = ROOT / "tools/fixtures/v013_shadow_cases.json"
-
-
-def angle_diff(a: float, b: float) -> float:
-    d = abs(a - b) % 360.0
-    return 360.0 - d if d > 180.0 else d
+ROOT=Path(__file__).resolve().parents[1]
+DB=ROOT/"app/src/main/assets/road_geometry.sqlite"
+CASES=ROOT/"tools/fixtures/v015_shadow_cases.json"
 
 
-def normalize_bearing(v: float) -> float:
-    return v % 360.0
+def angle_diff(a,b):
+    d=abs(a-b)%360.0
+    return 360.0-d if d>180.0 else d
 
 
-def nearest_to_polyline(lat: float, lon: float, points: list[tuple[float, float]]) -> tuple[float, float] | None:
-    if len(points) < 2:
-        return None
-    meters_per_lon = 111_320.0 * math.cos(math.radians(lat))
-    meters_per_lat = 110_540.0
-    best_distance = float("inf")
-    best_bearing = 0.0
-    for a, b in zip(points, points[1:]):
-        ax = (a[1] - lon) * meters_per_lon
-        ay = (a[0] - lat) * meters_per_lat
-        bx = (b[1] - lon) * meters_per_lon
-        by = (b[0] - lat) * meters_per_lat
-        vx, vy = bx - ax, by - ay
-        vv = vx * vx + vy * vy
-        if vv < 1e-6:
-            continue
-        t = max(0.0, min(1.0, -(ax * vx + ay * vy) / vv))
-        qx, qy = ax + t * vx, ay + t * vy
-        dist = math.hypot(qx, qy)
-        if dist < best_distance:
-            best_distance = dist
-            best_bearing = normalize_bearing(math.degrees(math.atan2(vx, vy)))
-    if not math.isfinite(best_distance):
-        return None
-    return best_distance, best_bearing
+def nearest(lat,lon,points):
+    if len(points)<2:return None
+    mx=111320.0*math.cos(math.radians(lat)); my=110540.0
+    best=(float('inf'),0.0)
+    for a,b in zip(points,points[1:]):
+        ax=(a[1]-lon)*mx; ay=(a[0]-lat)*my; bx=(b[1]-lon)*mx; by=(b[0]-lat)*my
+        vx=bx-ax; vy=by-ay; vv=vx*vx+vy*vy
+        if vv<1e-6:continue
+        t=max(0.0,min(1.0,-(ax*vx+ay*vy)/vv)); qx=ax+t*vx; qy=ay+t*vy
+        d=math.hypot(qx,qy)
+        if d<best[0]: best=(d,math.degrees(math.atan2(vx,vy))%360.0)
+    return None if not math.isfinite(best[0]) else best
 
 
-def classify(distance_m: float, heading_delta_deg: float, bearing_available: bool) -> str:
-    if distance_m > COVERAGE_DISTANCE_M:
-        return "outside_coverage"
-    if not bearing_available:
-        return "position_only"
-    if distance_m <= SUPPORT_DISTANCE_M and heading_delta_deg <= SUPPORT_HEADING_DEG:
-        return "support"
-    if distance_m <= WEAK_SUPPORT_DISTANCE_M and heading_delta_deg <= WEAK_SUPPORT_HEADING_DEG:
-        return "weak_support"
-    if heading_delta_deg >= CONFLICT_HEADING_DEG:
-        return "conflict"
-    return "uncertain"
+def classify_positive(d,h,bearing_available=True):
+    if d>COVERAGE_DISTANCE_M:return 'outside_coverage'
+    if not bearing_available:return 'position_only'
+    if d<=SUPPORT_DISTANCE_M and h<=SUPPORT_HEADING_DEG:return 'support'
+    if d<=WEAK_SUPPORT_DISTANCE_M and h<=WEAK_SUPPORT_HEADING_DEG:return 'weak_support'
+    if h>=CONFLICT_HEADING_DEG:return 'conflict'
+    return 'uncertain'
 
 
-def load_segments() -> tuple[dict[tuple[str, str], list[dict]], dict[str, str]]:
-    con = sqlite3.connect(DB)
+def load_db():
+    con=sqlite3.connect(DB)
     try:
-        meta = dict(con.execute("SELECT key,value FROM meta"))
-        segments: dict[tuple[str, str], list[dict]] = {}
-        for sid, cid, typ, source, confidence in con.execute(
-            "SELECT segment_id,camera_id,camera_type,source_kind,confidence FROM road_segments ORDER BY segment_id"
-        ):
-            pts = [
-                (lat, lon)
-                for _, lat, lon in con.execute(
-                    "SELECT seq,latitude,longitude FROM road_points WHERE segment_id=? ORDER BY seq", (sid,)
-                )
-            ]
-            segments.setdefault((str(cid), typ), []).append(
-                {"id": sid, "source": source, "confidence": confidence, "points": pts}
-            )
-        integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise RuntimeError(f"road geometry DB integrity_check={integrity}")
-        return segments, meta
-    finally:
-        con.close()
+        assert con.execute('pragma integrity_check').fetchone()[0]=='ok'
+        meta=dict(con.execute('select key,value from meta'))
+        pos={}; neg={}
+        for sid,cid,typ,src,conf in con.execute('select segment_id,camera_id,camera_type,source_kind,confidence from road_segments order by segment_id'):
+            pts=[(lat,lon) for _,lat,lon in con.execute('select seq,latitude,longitude from road_points where segment_id=? order by seq',(sid,))]
+            pos.setdefault((str(cid),typ),[]).append(dict(id=sid,source=src,confidence=conf,points=pts))
+        for sid,cid,typ,src,conf,label in con.execute('select exclusion_id,camera_id,camera_type,source_kind,confidence,label from exclusion_segments order by exclusion_id'):
+            pts=[(lat,lon) for _,lat,lon in con.execute('select seq,latitude,longitude from exclusion_points where exclusion_id=? order by seq',(sid,))]
+            neg.setdefault((str(cid),typ),[]).append(dict(id=sid,source=src,confidence=conf,label=label,points=pts))
+        return meta,pos,neg
+    finally:con.close()
 
 
-def evaluate(segments: dict, camera_id: str, camera_type: str, lat: float, lon: float, bearing: float | None):
-    candidates = []
-    for seg in segments.get((str(camera_id), camera_type), []):
-        nearest = nearest_to_polyline(lat, lon, seg["points"])
-        if nearest is None:
-            continue
-        distance, route_bearing = nearest
-        delta = angle_diff(bearing, route_bearing) if bearing is not None else 180.0
-        verdict = classify(distance, delta, bearing is not None)
-        candidates.append({**seg, "distance": distance, "delta": delta, "verdict": verdict})
-    if not candidates:
-        return None, []
+def evaluate(pos,neg,cid,typ,lat,lon,bearing):
+    positives=[]; negatives=[]
+    for s in pos.get((cid,typ),[]):
+        n=nearest(lat,lon,s['points']);
+        if n is None:continue
+        d,b=n; h=angle_diff(bearing,b) if bearing is not None else 180.0
+        positives.append({**s,'distance':d,'delta':h,'verdict':classify_positive(d,h,bearing is not None),'kind':'positive'})
+    for s in neg.get((cid,typ),[]):
+        n=nearest(lat,lon,s['points']);
+        if n is None:continue
+        d,b=n; h=angle_diff(bearing,b) if bearing is not None else 180.0
+        negatives.append({**s,'distance':d,'delta':h,'kind':'negative'})
 
-    def choose(verdict: str):
-        xs = [c for c in candidates if c["verdict"] == verdict]
-        if not xs:
-            return None
-        return min(xs, key=lambda c: c["distance"] + min(c["delta"], 180.0) * 0.35)
+    def choose_positive(v):
+        xs=[x for x in positives if x['verdict']==v]
+        return min(xs,key=lambda x:x['distance']+min(x['delta'],180)*.35) if xs else None
 
-    chosen = (
-        choose("support")
-        or choose("weak_support")
-        or choose("uncertain")
-        or choose("position_only")
-        or choose("conflict")
-        or min(candidates, key=lambda c: c["distance"])
-    )
-    return chosen, candidates
+    strong=choose_positive('support') or choose_positive('weak_support')
+    if strong:return strong
+
+    if bearing is not None:
+        nm=[x for x in negatives if x['distance']<=NEGATIVE_ROUTE_DISTANCE_M and x['delta']<=NEGATIVE_ROUTE_HEADING_DEG]
+        if nm:
+            x=min(nm,key=lambda x:x['distance']+x['delta']*.35).copy(); x['verdict']='negative_route'; return x
+
+    fallback=choose_positive('uncertain') or choose_positive('position_only') or choose_positive('conflict')
+    if fallback:return fallback
+    if positives:return min(positives,key=lambda x:x['distance'])
+    if negatives:
+        x=min(negatives,key=lambda x:x['distance']).copy(); x['verdict']='outside_coverage'; return x
+    return None
 
 
-def main() -> int:
-    segments, meta = load_segments()
-    failures = []
+def main():
+    meta,pos,neg=load_db(); failures=[]
+    if meta.get('engine_effect')!='explicit_negative_only':failures.append('engine_effect must be explicit_negative_only')
+    if meta.get('mode')!='guarded_negative_veto':failures.append('mode must be guarded_negative_veto')
+    if meta.get('generic_geometry_engine_effect')!='false':failures.append('generic geometry must remain shadow-only')
+    if meta.get('explicit_negative_veto')!='true':failures.append('explicit negative veto must be enabled')
+    if meta.get('policy')!=POLICY:failures.append(f"policy={meta.get('policy')} expected={POLICY}")
+    if len(neg.get(('14550','speed'),[]))<2:failures.append('14550 requires two explicit negative-route segments')
 
-    if meta.get("engine_effect") != "false":
-        failures.append("DB meta engine_effect must remain false")
-    if meta.get("mode") != "shadow_only":
-        failures.append("DB meta mode must remain shadow_only")
-    if meta.get("policy") != POLICY:
-        failures.append(f"DB policy {meta.get('policy')} != {POLICY}")
-
-    data = json.loads(CASES.read_text(encoding="utf-8"))
-    print(f"ROAD GEOMETRY SHADOW TEST: policy={POLICY} cases={len(data['cases'])}")
-    for case in data["cases"]:
-        chosen, all_candidates = evaluate(
-            segments,
-            case["camera_id"],
-            case["camera_type"],
-            float(case["lat"]),
-            float(case["lon"]),
-            None if case.get("bearing") is None else float(case["bearing"]),
-        )
-        if chosen is None:
-            failures.append(f"{case['name']}: no geometry")
-            print(f"  FAIL {case['name']}: no geometry")
-            continue
-        verdict = chosen["verdict"]
-        allowed = case["allowed"]
-        status = "PASS" if verdict in allowed else "FAIL"
-        print(
-            f"  {status} {case['name']}: {verdict} "
-            f"d={chosen['distance']:.1f}m headingDelta={chosen['delta']:.1f}° "
-            f"segment={chosen['id']} candidates={len(all_candidates)}"
-        )
-        if verdict not in allowed:
-            failures.append(f"{case['name']}: verdict={verdict}, allowed={allowed}")
-
+    cases=json.loads(CASES.read_text(encoding='utf-8'))['cases']
+    print(f'ROAD GEOMETRY SHADOW TEST: policy={POLICY} cases={len(cases)}')
+    for c in cases:
+        x=evaluate(pos,neg,str(c['camera_id']),c['camera_type'],float(c['lat']),float(c['lon']),None if c.get('bearing') is None else float(c['bearing']))
+        if x is None:
+            failures.append(c['name']+': no geometry'); print('  FAIL',c['name'],': no geometry'); continue
+        ok=x['verdict'] in c['allowed']
+        print(f"  {'PASS' if ok else 'FAIL'} {c['name']}: {x['verdict']} d={x['distance']:.1f}m headingDelta={x['delta']:.1f}° kind={x['kind']} segment={x['id']}")
+        if not ok:failures.append(f"{c['name']}: {x['verdict']} not in {c['allowed']}")
     if failures:
-        print("ROAD GEOMETRY SHADOW TEST: FAIL")
-        for f in failures:
-            print(" -", f)
+        print('ROAD GEOMETRY SHADOW TEST: FAIL')
+        for f in failures:print(' -',f)
         return 2
-
-    print("ROAD GEOMETRY SHADOW TEST: PASS")
+    print('ROAD GEOMETRY SHADOW TEST: PASS')
     return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=='__main__':raise SystemExit(main())

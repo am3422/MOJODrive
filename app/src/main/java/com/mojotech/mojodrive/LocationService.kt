@@ -145,7 +145,8 @@ class LocationService : Service(), LocationListener, SensorEventListener {
         var warningStartedElapsed: Long = 0L,
         var firstAlertDelivered: Boolean = false,
         var lastPulseElapsed: Long = 0L,
-        var missedDuringGapLogged: Boolean = false
+        var missedDuringGapLogged: Boolean = false,
+        var explicitNegativeSuppressionLogged: Boolean = false
     )
 
     private data class AlertRequest(
@@ -175,7 +176,7 @@ class LocationService : Service(), LocationListener, SensorEventListener {
     private var cameraClusters: List<CameraCluster> = emptyList()
     private val cameraStates = HashMap<String, CameraTrackState>()
 
-    // v0.13 diagnostic-only road geometry. It never changes camera decisions.
+    // v0.15: generic road geometry remains shadow-only; only explicit user-confirmed negative-route evidence may veto a first live alert.
     private var roadGeometryShadow: RoadGeometryShadow? = null
 
     private val handler = Handler(Looper.getMainLooper())
@@ -419,10 +420,12 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             )
             appendMarker(
                 "ROAD_GEOMETRY_SHADOW_READY",
-                "segments=${roadGeometryShadow?.segmentCount ?: 0};" +
+                "positiveSegments=${roadGeometryShadow?.positiveSegmentCount ?: 0};" +
+                    "negativeSegments=${roadGeometryShadow?.negativeSegmentCount ?: 0};" +
                     "coveredCameras=${roadGeometryShadow?.coveredCameraCount ?: 0};" +
-                    "mode=shadow_only;engine_effect=false;" +
-                    "policy=${RoadGeometryShadow.POLICY}"
+                    "negativeCameras=${roadGeometryShadow?.negativeCoveredCameraCount ?: 0};" +
+                    "mode=guarded_negative_veto;generic_engine_effect=false;" +
+                    "explicit_negative_veto=true;policy=${RoadGeometryShadow.POLICY}"
             )
         }
 
@@ -1917,6 +1920,45 @@ class LocationService : Service(), LocationListener, SensorEventListener {
             return null
         }
 
+        // BEGIN V0.15 GUARDED NEGATIVE ROUTE VETO
+        // Deliberately narrow live influence. Generic support/conflict/outside-coverage
+        // remains diagnostic-only. We veto only a FIRST, non-bridged alert when the vehicle
+        // is on an explicitly user-confirmed false-warning route and both position + heading
+        // match that route. Once an alert has started, geometry cannot mute it.
+        if (!bridge && !state.warned) {
+            val explicitNegative = try {
+                roadGeometryShadow?.evaluate(
+                    geometry.cluster.memberIds,
+                    geometry.cluster.camera.type,
+                    latestLat,
+                    latestLon,
+                    if (latestBearingValid) latestBearing else null
+                )
+            } catch (_: Exception) {
+                null
+            }
+
+            if (
+                explicitNegative?.verdict == "negative_route" &&
+                explicitNegative.evidenceKind == "explicit_negative"
+            ) {
+                state.alertLevel = 0
+                if (!state.explicitNegativeSuppressionLogged) {
+                    state.explicitNegativeSuppressionLogged = true
+                    appendCameraEvent(
+                        "CAMERA_NEGATIVE_ROUTE_SUPPRESSED",
+                        geometry,
+                        state,
+                        "negativeLabel=${explicitNegative.negativeLabel ?: ""};" +
+                            "negativeDistanceM=${String.format(Locale.US, "%.1f", explicitNegative.corridorDistanceM)};" +
+                            "negativeHeadingDelta=${String.format(Locale.US, "%.1f", explicitNegative.headingDeltaDeg)};" +
+                            "bridge=$bridge;policy=${RoadGeometryShadow.POLICY}"
+                    )
+                }
+                return null
+            }
+        }
+        // END V0.15 GUARDED NEGATIVE ROUTE VETO
         val level = computeCameraAlertLevel(
             geometry.vehicleForwardM,
             geometry.ttcS,

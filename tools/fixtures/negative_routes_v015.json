@@ -1,0 +1,26 @@
+{
+  "source_trip": "MOJODrive_Trip_20260928_094832.csv",
+  "ground_truth": "User confirmed the final camera 14550 warning was false: the camera was on the opposite side/level while the vehicle was on the hill route.",
+  "labels": [
+    {
+      "camera_id": "14550",
+      "camera_type": "speed",
+      "source_log": "v014_trip_20260928_094832_locations.csv",
+      "start_wall_time_ms": 1790578659608,
+      "end_wall_time_ms": 1790578715690,
+      "label": "14550_opposite_level_approach",
+      "confidence": "high",
+      "reason": "user_confirmed_opposite_carriageway_or_level"
+    },
+    {
+      "camera_id": "14550",
+      "camera_type": "speed",
+      "source_log": "v014_trip_20260928_094832_locations.csv",
+      "start_wall_time_ms": 1790578715690,
+      "end_wall_time_ms": 1790578750000,
+      "label": "14550_hill_return_false_warning",
+      "confidence": "high",
+      "reason": "user_confirmed_final_warning_false_on_hill_route"
+    }
+  ]
+}
