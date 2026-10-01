@@ -3,7 +3,7 @@ name: Build MOJO Drive APK
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "fars-direction-v2" ]
 
 jobs:
   build:
@@ -41,11 +41,14 @@ jobs:
       - name: Guard explicit negative-route live veto
         run: python3 tools/negative_route_veto_guard.py
 
+      - name: Validate FARS direction database
+        run: python3 tools/validate_fars_direction_v2.py
+
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MOJODrive-MVP-0.15-debug
+          name: MOJODrive-FARS-DIRECTION-V2-debug
           path: app/build/outputs/apk/debug/app-debug.apk

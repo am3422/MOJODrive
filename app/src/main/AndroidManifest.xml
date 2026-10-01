@@ -15,7 +15,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="MOJO Drive"
+        android:label="MOJO FARS V2"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 

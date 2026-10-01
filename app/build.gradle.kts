@@ -8,11 +8,11 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.mojotech.mojodrive"
+        applicationId = "com.mojotech.mojodrive.farsv2"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "0.15"
+        versionCode = 16
+        versionName = "0.15-fars-direction-v2"
     }
 
     compileOptions {

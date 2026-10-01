@@ -1,7 +1,7 @@
 {
   "baseline": "MOJO Drive MVP 0.12 FULL FIXED",
   "commit": "bcbea01543c29d8c5b4b72f40093a3498bd298d6",
-  "camera_db_sha256": "23df223faf7baccd84e4a7111746103d104a75eac7789bdec34df8a67bc79087",
+  "camera_db_sha256": "718071df9c79cbb9e8e5bc68e5ad389ca0f88861f2af86b64368cf6ea0e49488",
   "trips": {
     "v012_trip_20260926_121128_locations.csv": [
       "speed:10397+12503",

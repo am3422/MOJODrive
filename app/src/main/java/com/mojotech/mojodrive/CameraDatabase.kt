@@ -22,7 +22,9 @@ data class CameraPoint(
 )
 
 class CameraDatabase(private val context: Context) {
-    private val dbFile = File(context.filesDir, "shiraz_cameras_v11.sqlite")
+    // FARS DIRECTION V2 uses a new private filename so Android cannot silently reuse
+    // an older copied camera DB after installing/updating this experimental build.
+    private val dbFile = File(context.filesDir, "fars_direction_v2.sqlite")
 
     private fun ensureDatabase() {
         if (dbFile.exists() && dbFile.length() > 0L) return

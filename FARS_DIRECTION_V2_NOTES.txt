@@ -1,0 +1,40 @@
+MOJODrive 0.15 - FARS DIRECTION V2 experimental road-test build
+
+Goal
+- Preserve the field-validated v0.12/v0.15 live engine exactly.
+- Fix the Fars combined-test failure where raw Fars cameras had no directed road metadata,
+  causing opposite-carriageway cameras to pass directionGateOk with directionDelta=0.
+
+What changed
+1) Stable 267-camera MOJODrive database rows are preserved exactly.
+2) 214 Fars additions remain after a generic road-metadata quality gate.
+   29 additions with missing road name / speed limit / road distance were excluded.
+3) 28 Fars cameras on the actual 2026-09-30 Shiraz->Lar field corridor now have directed
+   road_bearing + oneway + direction_confidence metadata learned from the field route and
+   directional road naming / conservative paired-lane evidence.
+4) Opposite pairs FARS_7943/7953, FARS_5251/5268, FARS_8569/8610 are now ~180 degrees apart,
+   so the existing clustering and direction gate can separate them without any matcher change.
+5) CameraDatabase private copy filename is bumped to fars_direction_v2.sqlite so an older
+   copied database cannot be silently reused.
+6) Separate applicationId: com.mojotech.mojodrive.farsv2; label: MOJO FARS V2.
+
+Not changed
+- LocationService camera matcher thresholds or functions.
+- GPS/location pipeline.
+- speed/fusion logic.
+- alert timing / tones / vibration.
+- road geometry v0.15 guarded negative veto.
+
+Validation
+- SQLite integrity: PASS
+- Stable rows identical: 267/267
+- Total active cameras: 481 = 267 stable + 214 Fars
+- Directed Fars route cameras: 28
+- Old outbound false-direction examples now rejected by direction metadata:
+  FARS_6552, 3429, 4560, 5268, 3695, 10553.
+- Low-metadata FARS_4770 is removed by the general quality gate, not an ID blacklist.
+
+Important scope
+This is a field-route-trained experimental Fars build. It is specifically strengthened for the
+same Shiraz<->Lar corridor. Fars cameras outside that learned corridor can still have unknown
+direction metadata. This build intentionally changes data, not the locked live matcher.
